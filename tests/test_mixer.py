@@ -2,9 +2,11 @@ import pytest
 
 from narada.audio.mixer import (
     AudioChunk,
+    DriftResyncState,
     downmix_to_mono,
     mix_audio_chunks,
     normalize_for_mix,
+    resync_streams,
 )
 
 
@@ -33,3 +35,25 @@ def test_mix_audio_chunks_handles_different_rates_and_channels() -> None:
     assert sample_rate == 16000
     assert len(mixed) > 0
     assert all(-1.0 <= sample <= 1.0 for sample in mixed)
+
+
+def test_resync_streams_aligns_shifted_sequences() -> None:
+    mic = [0.0, 0.0, 0.2, 0.7, 0.1]
+    system = [0.2, 0.7, 0.1]
+    aligned_mic, aligned_system = resync_streams(mic, system, sample_rate_hz=1000)
+    assert len(aligned_mic) == len(aligned_system)
+    naive_mic = mic[: len(system)]
+    naive_error = sum(abs(naive_mic[idx] - system[idx]) for idx in range(len(system)))
+    aligned_error = sum(
+        abs(aligned_mic[idx] - aligned_system[idx]) for idx in range(len(aligned_system))
+    )
+    assert aligned_error < naive_error
+
+
+def test_mix_audio_chunks_with_resync_state_reduces_drift() -> None:
+    state = DriftResyncState(max_drift_ms=200)
+    mic = AudioChunk(samples=(0.0, 0.0, 1.0, 1.0, 1.0, 1.0), sample_rate_hz=1000, channels=1)
+    system = AudioChunk(samples=(1.0, 1.0, 1.0, 1.0), sample_rate_hz=1000, channels=1)
+    mixed, _ = mix_audio_chunks(mic, system, resync_state=state, headroom=0.8)
+    assert mixed
+    assert mixed[0] == pytest.approx(0.72, rel=1e-3)

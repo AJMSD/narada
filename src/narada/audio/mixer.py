@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -9,6 +10,17 @@ class AudioChunk:
     samples: tuple[float, ...]
     sample_rate_hz: int
     channels: int = 1
+
+
+@dataclass
+class DriftResyncState:
+    max_drift_ms: int = 120
+    mic_carry: list[float] = field(default_factory=list)
+    system_carry: list[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.max_drift_ms <= 0:
+            raise ValueError("max_drift_ms must be positive.")
 
 
 def resample_linear(samples: Sequence[float], src_rate: int, dst_rate: int) -> list[float]:
@@ -88,13 +100,99 @@ def mix_streams(
     return mixed
 
 
+def _best_shift(mic: Sequence[float], system: Sequence[float], max_shift: int) -> int:
+    if max_shift <= 0:
+        return 0
+    if not mic or not system:
+        return 0
+
+    best_shift = 0
+    best_score = -math.inf
+    for shift in range(-max_shift, max_shift + 1):
+        if shift >= 0:
+            mic_start = shift
+            sys_start = 0
+        else:
+            mic_start = 0
+            sys_start = -shift
+        overlap = min(len(mic) - mic_start, len(system) - sys_start)
+        if overlap <= 0:
+            continue
+        score = 0.0
+        for idx in range(overlap):
+            score += mic[mic_start + idx] * system[sys_start + idx]
+        if score > best_score:
+            best_score = score
+            best_shift = shift
+    return best_shift
+
+
+def resync_streams(
+    mic: Sequence[float],
+    system: Sequence[float],
+    sample_rate_hz: int,
+    state: DriftResyncState | None = None,
+) -> tuple[list[float], list[float]]:
+    if sample_rate_hz <= 0:
+        raise ValueError("sample_rate_hz must be positive.")
+    max_drift_samples = int(sample_rate_hz * ((state.max_drift_ms if state else 120) / 1000.0))
+    max_drift_samples = max(1, max_drift_samples)
+
+    mic_work = list(mic)
+    sys_work = list(system)
+    if state:
+        if state.mic_carry:
+            mic_work = [*state.mic_carry, *mic_work]
+            state.mic_carry = []
+        if state.system_carry:
+            sys_work = [*state.system_carry, *sys_work]
+            state.system_carry = []
+
+    length_diff = len(mic_work) - len(sys_work)
+    if abs(length_diff) > max_drift_samples:
+        trim = abs(length_diff) - max_drift_samples
+        if length_diff > 0:
+            mic_work = mic_work[trim:]
+        else:
+            sys_work = sys_work[trim:]
+
+    max_shift = min(max_drift_samples, max(0, min(len(mic_work), len(sys_work)) - 1))
+    shift = _best_shift(mic_work, sys_work, max_shift=max_shift)
+    if shift > 0:
+        mic_work = mic_work[shift:]
+    elif shift < 0:
+        sys_work = sys_work[-shift:]
+
+    overlap = min(len(mic_work), len(sys_work))
+    aligned_mic = mic_work[:overlap]
+    aligned_system = sys_work[:overlap]
+
+    if state:
+        state.mic_carry = mic_work[overlap:]
+        state.system_carry = sys_work[overlap:]
+        max_carry = max_drift_samples * 2
+        if len(state.mic_carry) > max_carry:
+            state.mic_carry = state.mic_carry[-max_carry:]
+        if len(state.system_carry) > max_carry:
+            state.system_carry = state.system_carry[-max_carry:]
+
+    return aligned_mic, aligned_system
+
+
 def mix_audio_chunks(
     mic_chunk: AudioChunk,
     system_chunk: AudioChunk,
     target_rate_hz: int | None = None,
     headroom: float = 0.8,
+    resync_state: DriftResyncState | None = None,
 ) -> tuple[list[float], int]:
     selected_rate = target_rate_hz or max(mic_chunk.sample_rate_hz, system_chunk.sample_rate_hz)
     mic_normalized = normalize_for_mix(mic_chunk, target_rate_hz=selected_rate)
     system_normalized = normalize_for_mix(system_chunk, target_rate_hz=selected_rate)
-    return mix_streams(mic_normalized, system_normalized, headroom=headroom), selected_rate
+    aligned_mic, aligned_system = resync_streams(
+        mic_normalized,
+        system_normalized,
+        sample_rate_hz=selected_rate,
+        state=resync_state,
+    )
+    return mix_streams(aligned_mic, aligned_system, headroom=headroom), selected_rate

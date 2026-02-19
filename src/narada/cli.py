@@ -23,7 +23,7 @@ from narada.audio.capture import (
     open_system_capture,
     pcm16le_to_float32,
 )
-from narada.audio.mixer import AudioChunk, mix_audio_chunks
+from narada.audio.mixer import AudioChunk, DriftResyncState, mix_audio_chunks
 from narada.config import ConfigError, ConfigOverrides, build_runtime_config
 from narada.devices import (
     DEVICE_TYPES,
@@ -182,6 +182,7 @@ def start_command(
     warned_missing_engine_for_audio = False
     mic_capture = None
     system_capture = None
+    mixed_resync_state = DriftResyncState()
     try:
         with TranscriptWriter(config.out) as writer:
             if sys.stdin.isatty():
@@ -236,6 +237,7 @@ def start_command(
                                     sample_rate_hz=system_frame.sample_rate_hz,
                                     channels=system_frame.channels,
                                 ),
+                                resync_state=mixed_resync_state,
                             )
                             request = TranscriptionRequest(
                                 pcm_bytes=mono_frame_to_pcm16le(
