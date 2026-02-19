@@ -11,6 +11,7 @@ from typing import cast
 import typer
 
 from narada.asr.base import (
+    AsrEngine,
     EngineUnavailableError,
     TranscriptionRequest,
     TranscriptSegment,
@@ -24,7 +25,7 @@ from narada.audio.capture import (
     pcm16le_to_float32,
 )
 from narada.audio.mixer import AudioChunk, DriftResyncState, mix_audio_chunks
-from narada.config import ConfigError, ConfigOverrides, build_runtime_config
+from narada.config import ConfigError, ConfigOverrides, RuntimeConfig, build_runtime_config
 from narada.devices import (
     DEVICE_TYPES,
     AmbiguousDeviceError,
@@ -39,7 +40,7 @@ from narada.devices import (
 )
 from narada.doctor import format_doctor_report, has_failures, run_doctor
 from narada.logging_setup import setup_logging
-from narada.pipeline import ConfidenceGate
+from narada.pipeline import AudioChunkWindow, ConfidenceGate, OverlapChunker
 from narada.redaction import redact_text
 from narada.server import serve_transcript_file
 from narada.start_runtime import MonoAudioFrame, mono_frame_to_pcm16le, parse_input_line
@@ -76,6 +77,26 @@ def _elapsed(started_at: float) -> str:
     minutes = (total % 3600) // 60
     seconds = total % 60
     return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+
+def _transcribe_windows(
+    windows: list[AudioChunkWindow],
+    *,
+    engine_instance: AsrEngine,
+    config: RuntimeConfig,
+) -> list[TranscriptSegment]:
+    segments: list[TranscriptSegment] = []
+    for window in windows:
+        request = TranscriptionRequest(
+            pcm_bytes=window.pcm_bytes,
+            sample_rate_hz=window.sample_rate_hz,
+            languages=config.languages,
+            model=config.model,
+            compute=config.compute,
+        )
+        result = engine_instance.transcribe(request)
+        segments.extend(result)
+    return segments
 
 
 @app.command("devices")
@@ -183,8 +204,10 @@ def start_command(
     mic_capture = None
     system_capture = None
     mixed_resync_state = DriftResyncState()
+    stopped_by_user = False
     try:
         with TranscriptWriter(config.out) as writer:
+            audio_chunker = OverlapChunker(chunk_duration_s=6.0, overlap_duration_s=1.5)
             if sys.stdin.isatty():
                 if config.mode in {"mic", "mixed"} and mic_device is not None:
                     mic_capture = open_mic_capture(device=mic_device)
@@ -194,75 +217,85 @@ def start_command(
                         all_devices=all_devices,
                     )
 
-                while True:
-                    segments: list[TranscriptSegment] = []
-                    if config.mode == "mic" and mic_capture is not None:
-                        mic_frame = mic_capture.read_frame()
-                        if mic_frame and engine_available:
-                            request = TranscriptionRequest(
-                                pcm_bytes=mic_frame.pcm_bytes,
-                                sample_rate_hz=mic_frame.sample_rate_hz,
-                                languages=config.languages,
-                                model=config.model,
-                                compute=config.compute,
-                            )
-                            segments.extend(engine_instance.transcribe(request))
-                    elif config.mode == "system" and system_capture is not None:
-                        system_frame = system_capture.read_frame()
-                        if system_frame and engine_available:
-                            request = TranscriptionRequest(
-                                pcm_bytes=system_frame.pcm_bytes,
-                                sample_rate_hz=system_frame.sample_rate_hz,
-                                languages=config.languages,
-                                model=config.model,
-                                compute=config.compute,
-                            )
-                            segments.extend(engine_instance.transcribe(request))
-                    elif (
-                        config.mode == "mixed"
-                        and mic_capture is not None
-                        and system_capture is not None
-                    ):
-                        mic_frame = mic_capture.read_frame()
-                        system_frame = system_capture.read_frame()
-                        if mic_frame and system_frame and engine_available:
-                            mixed_samples, mixed_rate = mix_audio_chunks(
-                                AudioChunk(
-                                    samples=pcm16le_to_float32(mic_frame.pcm_bytes),
-                                    sample_rate_hz=mic_frame.sample_rate_hz,
-                                    channels=mic_frame.channels,
-                                ),
-                                AudioChunk(
-                                    samples=pcm16le_to_float32(system_frame.pcm_bytes),
-                                    sample_rate_hz=system_frame.sample_rate_hz,
-                                    channels=system_frame.channels,
-                                ),
-                                resync_state=mixed_resync_state,
-                            )
-                            request = TranscriptionRequest(
-                                pcm_bytes=mono_frame_to_pcm16le(
-                                    MonoAudioFrame(
-                                        samples=tuple(mixed_samples),
-                                        sample_rate_hz=mixed_rate,
+                try:
+                    while True:
+                        segments: list[TranscriptSegment] = []
+                        audio_windows: list[AudioChunkWindow] = []
+                        if config.mode == "mic" and mic_capture is not None:
+                            mic_frame = mic_capture.read_frame()
+                            if mic_frame:
+                                audio_windows.extend(
+                                    audio_chunker.ingest(
+                                        mic_frame.pcm_bytes,
+                                        mic_frame.sample_rate_hz,
+                                        mic_frame.channels,
                                     )
-                                ),
-                                sample_rate_hz=mixed_rate,
-                                languages=config.languages,
-                                model=config.model,
-                                compute=config.compute,
-                            )
-                            segments.extend(engine_instance.transcribe(request))
+                                )
+                        elif config.mode == "system" and system_capture is not None:
+                            system_frame = system_capture.read_frame()
+                            if system_frame:
+                                audio_windows.extend(
+                                    audio_chunker.ingest(
+                                        system_frame.pcm_bytes,
+                                        system_frame.sample_rate_hz,
+                                        system_frame.channels,
+                                    )
+                                )
+                        elif (
+                            config.mode == "mixed"
+                            and mic_capture is not None
+                            and system_capture is not None
+                        ):
+                            mic_frame = mic_capture.read_frame()
+                            system_frame = system_capture.read_frame()
+                            if mic_frame and system_frame:
+                                mixed_samples, mixed_rate = mix_audio_chunks(
+                                    AudioChunk(
+                                        samples=pcm16le_to_float32(mic_frame.pcm_bytes),
+                                        sample_rate_hz=mic_frame.sample_rate_hz,
+                                        channels=mic_frame.channels,
+                                    ),
+                                    AudioChunk(
+                                        samples=pcm16le_to_float32(system_frame.pcm_bytes),
+                                        sample_rate_hz=system_frame.sample_rate_hz,
+                                        channels=system_frame.channels,
+                                    ),
+                                    resync_state=mixed_resync_state,
+                                )
+                                audio_windows.extend(
+                                    audio_chunker.ingest(
+                                        mono_frame_to_pcm16le(
+                                            MonoAudioFrame(
+                                                samples=tuple(mixed_samples),
+                                                sample_rate_hz=mixed_rate,
+                                            )
+                                        ),
+                                        mixed_rate,
+                                        1,
+                                    )
+                                )
 
-                    committed = gate_state.ingest(segments)
-                    for item in committed:
-                        text = redact_text(item.text) if config.redact else item.text
-                        writer.append_line(text)
-                    typer.echo(
-                        f"\rREC {_elapsed(started_at)} | mode={config.mode} "
-                        f"| model={config.model} | rtf=n/a",
-                        nl=False,
-                    )
-                    time.sleep(1.0)
+                        if audio_windows and engine_available:
+                            segments.extend(
+                                _transcribe_windows(
+                                    audio_windows,
+                                    engine_instance=engine_instance,
+                                    config=config,
+                                )
+                            )
+
+                        committed = gate_state.ingest(segments)
+                        for item in committed:
+                            text = redact_text(item.text) if config.redact else item.text
+                            writer.append_line(text)
+                        typer.echo(
+                            f"\rREC {_elapsed(started_at)} | mode={config.mode} "
+                            f"| model={config.model} | rtf=n/a",
+                            nl=False,
+                        )
+                        time.sleep(1.0)
+                except KeyboardInterrupt:
+                    stopped_by_user = True
             else:
                 for line in sys.stdin:
                     try:
@@ -293,34 +326,51 @@ def start_command(
                                 )
                                 warned_missing_engine_for_audio = True
                         else:
-                            request = TranscriptionRequest(
-                                pcm_bytes=mono_frame_to_pcm16le(parsed.audio),
-                                sample_rate_hz=parsed.audio.sample_rate_hz,
-                                languages=config.languages,
-                                model=config.model,
-                                compute=config.compute,
+                            audio_windows = audio_chunker.ingest(
+                                mono_frame_to_pcm16le(parsed.audio),
+                                parsed.audio.sample_rate_hz,
+                                1,
                             )
-                            stdin_segments.extend(engine_instance.transcribe(request))
+                            stdin_segments.extend(
+                                _transcribe_windows(
+                                    audio_windows,
+                                    engine_instance=engine_instance,
+                                    config=config,
+                                )
+                            )
                     committed = gate_state.ingest(stdin_segments)
                     for item in committed:
                         text = redact_text(item.text) if config.redact else item.text
                         writer.append_line(text)
-                for pending in gate_state.drain_pending():
-                    text = redact_text(pending.text) if config.redact else pending.text
+
+            remaining_windows = audio_chunker.flush(force=True)
+            if remaining_windows and engine_available:
+                tail_segments = _transcribe_windows(
+                    remaining_windows,
+                    engine_instance=engine_instance,
+                    config=config,
+                )
+                committed_tail = gate_state.ingest(tail_segments)
+                for item in committed_tail:
+                    text = redact_text(item.text) if config.redact else item.text
                     writer.append_line(text)
+
+            for pending in gate_state.drain_pending():
+                text = redact_text(pending.text) if config.redact else pending.text
+                writer.append_line(text)
     except DeviceDisconnectedError as exc:
         typer.echo(f"\nDevice disconnected: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     except CaptureError as exc:
         typer.echo(f"\nAudio capture error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
-    except KeyboardInterrupt:
-        typer.echo("\nStopped.")
     finally:
         if mic_capture is not None:
             mic_capture.close()
         if system_capture is not None:
             system_capture.close()
+    if stopped_by_user:
+        typer.echo("\nStopped.")
 
 
 @app.command("serve")
