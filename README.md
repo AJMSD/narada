@@ -14,6 +14,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
   - `narada serve`
   - `narada doctor`
 - Device selection by ID or name with fuzzy matching support.
+- Automatic OS-aware device deduplication in `narada devices` (use `--all` for raw endpoints).
 - `--language auto` default with multilingual input support through comma-separated values.
 - Software mixed mode target (mic + system in Narada).
 - Core PII redaction support (excluding names).
@@ -81,6 +82,11 @@ pip install -r requirements.txt
 List devices:
 ```bash
 narada devices
+```
+
+Show full raw backend endpoints (no dedupe):
+```bash
+narada devices --all
 ```
 
 Filter devices:

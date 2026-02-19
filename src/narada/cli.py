@@ -112,6 +112,11 @@ def _transcribe_windows(
 def devices_command(
     device_type: str | None = typer.Option(None, "--type", help="input|output|loopback|monitor"),
     search: str | None = typer.Option(None, "--search", help="Case-insensitive name filter."),
+    all_devices: bool = typer.Option(
+        False,
+        "--all",
+        help="Show raw backend endpoints without automatic deduplication.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Return JSON output."),
 ) -> None:
     if device_type is not None and device_type not in DEVICE_TYPES:
@@ -123,7 +128,7 @@ def devices_command(
     if device_type is not None:
         normalized_type = cast(DeviceType, device_type)
 
-    items = enumerate_devices()
+    items = enumerate_devices(include_all=all_devices)
     filtered = filter_devices(items, device_type=normalized_type, search=search)
     if json_output:
         typer.echo(devices_to_json(filtered))
