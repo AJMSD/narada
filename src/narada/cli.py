@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -9,7 +10,12 @@ from typing import cast
 
 import typer
 
-from narada.asr.base import EngineUnavailableError, TranscriptSegment, build_engine
+from narada.asr.base import (
+    EngineUnavailableError,
+    TranscriptionRequest,
+    TranscriptSegment,
+    build_engine,
+)
 from narada.config import ConfigError, ConfigOverrides, build_runtime_config
 from narada.devices import (
     DEVICE_TYPES,
@@ -23,12 +29,23 @@ from narada.devices import (
     resolve_device,
 )
 from narada.doctor import format_doctor_report, has_failures, run_doctor
+from narada.logging_setup import setup_logging
 from narada.pipeline import ConfidenceGate
 from narada.redaction import redact_text
 from narada.server import serve_transcript_file
+from narada.start_runtime import mono_frame_to_pcm16le, parse_input_line
 from narada.writer import TranscriptWriter
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Narada local transcript CLI.")
+logger = logging.getLogger("narada.cli")
+
+
+@app.callback()
+def app_callback(
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    log_file: Path | None = typer.Option(None, "--log-file", help="Optional log file path."),
+) -> None:
+    setup_logging(debug=debug, log_file=log_file)
 
 
 def _resolve_selected_devices(mode: str, mic: str | None, system: str | None) -> None:
@@ -134,6 +151,7 @@ def start_command(
         )
 
     gate_state = ConfidenceGate(config.confidence_threshold)
+    engine_available = engine_instance.is_available()
 
     typer.echo(
         "REC "
@@ -145,6 +163,7 @@ def start_command(
         typer.echo("No piped input detected. Waiting for Ctrl+C.")
 
     started_at = time.time()
+    warned_missing_engine_for_audio = False
     try:
         with TranscriptWriter(config.out) as writer:
             if sys.stdin.isatty():
@@ -157,9 +176,42 @@ def start_command(
                     time.sleep(1.0)
             else:
                 for line in sys.stdin:
-                    segments = [
-                        TranscriptSegment(text=line.strip(), confidence=1.0, start_s=0.0, end_s=0.0)
-                    ]
+                    try:
+                        parsed = parse_input_line(line, config.mode)
+                    except ValueError as exc:
+                        logger.warning("Skipping invalid stdin input: %s", exc)
+                        continue
+                    if parsed is None:
+                        continue
+                    segments: list[TranscriptSegment] = []
+                    if parsed.text:
+                        segments.append(
+                            TranscriptSegment(
+                                text=parsed.text,
+                                confidence=parsed.confidence,
+                                start_s=0.0,
+                                end_s=0.0,
+                                is_final=True,
+                            )
+                        )
+                    if parsed.audio:
+                        if not engine_available:
+                            if not warned_missing_engine_for_audio:
+                                typer.echo(
+                                    "Selected ASR engine is unavailable; "
+                                    "audio payloads are skipped.",
+                                    err=True,
+                                )
+                                warned_missing_engine_for_audio = True
+                        else:
+                            request = TranscriptionRequest(
+                                pcm_bytes=mono_frame_to_pcm16le(parsed.audio),
+                                sample_rate_hz=parsed.audio.sample_rate_hz,
+                                languages=config.languages,
+                                model=config.model,
+                                compute=config.compute,
+                            )
+                            segments.extend(engine_instance.transcribe(request))
                     committed = gate_state.ingest(segments)
                     for item in committed:
                         text = redact_text(item.text) if config.redact else item.text

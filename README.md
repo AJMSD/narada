@@ -3,7 +3,7 @@
 ## What Narada Is
 Narada is a local-first CLI tool for transcribing meeting audio to text files. It is designed to run without cloud upload and to support microphone, system, and mixed audio workflows across Windows, Linux, and macOS.
 
-## Why We Built It
+## Why I Built It
 Many meeting transcription tools require paid APIs or cloud upload of sensitive audio. Narada is built to provide a private local workflow with clear CLI controls and LAN-only sharing when explicitly enabled.
 
 ## Features
@@ -72,6 +72,11 @@ Start a session:
 narada start --mode mic --mic 1 --out ./transcripts/session.txt --language auto
 ```
 
+Enable debug logging:
+```bash
+narada --debug --log-file ./logs/narada.log start --mode mic --mic 1
+```
+
 Multilingual session:
 ```bash
 narada start --mode mic --mic 1 --language hindi,english --allow-multilingual
@@ -86,6 +91,12 @@ Run checks:
 ```bash
 narada doctor --file ./transcripts/session.txt
 ```
+
+Structured stdin for `start` (useful for tests or automation):
+- Plain text line: treated as transcript text.
+- JSON text payload: `{"text":"hello","confidence":0.9}`
+- JSON audio payload (mic/system): `{"audio":{"samples":[...],"sample_rate_hz":16000,"channels":1}}`
+- JSON mixed payload: `{"mic":{...},"system":{...}}` (Narada normalizes and software-mixes before ASR).
 
 ## Privacy And Security Behavior
 - No telemetry by default.
