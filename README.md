@@ -15,6 +15,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
   - `narada doctor`
 - Device selection by ID or name with fuzzy matching support.
 - Automatic OS-aware device deduplication in `narada devices` (use `--all` for raw endpoints).
+- Shared logical IDs for combo devices; Narada auto-selects input/output endpoint by command context.
 - `--language auto` default with multilingual input support through comma-separated values.
 - Software mixed mode target (mic + system in Narada).
 - Core PII redaction support (excluding names).

@@ -32,7 +32,7 @@ from narada.devices import (
     AmbiguousDeviceError,
     AudioDevice,
     DeviceResolutionError,
-    DeviceType,
+    EndpointType,
     devices_to_json,
     enumerate_devices,
     filter_devices,
@@ -63,14 +63,19 @@ def app_callback(
 def _resolve_selected_devices(
     mode: str, mic: str | None, system: str | None
 ) -> tuple[AudioDevice | None, AudioDevice | None, list[AudioDevice]]:
-    devices = enumerate_devices()
+    selectable_devices = enumerate_devices()
+    all_devices = enumerate_devices(include_all=True)
     resolved_mic: AudioDevice | None = None
     resolved_system: AudioDevice | None = None
     if mode in {"mic", "mixed"} and mic:
-        resolved_mic = resolve_device(mic, devices, {"input"})
+        resolved_mic = resolve_device(mic, selectable_devices, {"input"})
     if mode in {"system", "mixed"} and system:
-        resolved_system = resolve_device(system, devices, {"output", "loopback", "monitor"})
-    return resolved_mic, resolved_system, devices
+        resolved_system = resolve_device(
+            system,
+            selectable_devices,
+            {"output", "loopback", "monitor"},
+        )
+    return resolved_mic, resolved_system, all_devices
 
 
 def _elapsed(started_at: float) -> str:
@@ -124,9 +129,9 @@ def devices_command(
             f"Unsupported device type '{device_type}'. Expected one of: {', '.join(DEVICE_TYPES)}.",
             param_hint="--type",
         )
-    normalized_type: DeviceType | None = None
+    normalized_type: EndpointType | None = None
     if device_type is not None:
-        normalized_type = cast(DeviceType, device_type)
+        normalized_type = cast(EndpointType, device_type)
 
     items = enumerate_devices(include_all=all_devices)
     filtered = filter_devices(items, device_type=normalized_type, search=search)
