@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "narada"
+version = "0.1.0"
+description = "Local-first CLI transcriber for meetings and calls."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+  {name = "Narada Contributors"},
+]
+dependencies = [
+  "typer>=0.12.5,<1.0",
+]
+
+[project.optional-dependencies]
+asr = [
+  "faster-whisper>=1.1.0",
+  "whispercpp>=0.0.18",
+]
+audio = [
+  "sounddevice>=0.4.7",
+]
+noise = [
+  "webrtcvad-wheels>=2.0.14",
+]
+dev = [
+  "build>=1.2.2.post1",
+  "mypy>=1.15.0",
+  "pre-commit>=4.1.0",
+  "pytest>=8.3.4",
+  "ruff>=0.9.7",
+]
+
+[project.scripts]
+narada = "narada.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "I",
+  "B",
+  "UP",
+]
+ignore = [
+  "B008",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+ignore_missing_imports = true
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
