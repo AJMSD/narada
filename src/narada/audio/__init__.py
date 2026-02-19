@@ -1,1 +1,1 @@
-__all__ = ["mixer"]
+__all__ = ["capture", "mixer"]
