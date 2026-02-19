@@ -44,7 +44,12 @@ from narada.logging_setup import setup_logging
 from narada.performance import RuntimePerformance
 from narada.pipeline import AudioChunkWindow, ConfidenceGate, OverlapChunker
 from narada.redaction import redact_text
-from narada.server import serve_transcript_file
+from narada.server import (
+    RunningTranscriptServer,
+    render_ascii_qr,
+    serve_transcript_file,
+    start_transcript_server,
+)
 from narada.start_runtime import MonoAudioFrame, mono_frame_to_pcm16le, parse_input_line
 from narada.writer import TranscriptWriter
 
@@ -168,6 +173,26 @@ def start_command(
     gate: str | None = typer.Option(None, "--gate", help="on|off"),
     gate_threshold_db: float | None = typer.Option(None, "--gate-threshold-db"),
     confidence_threshold: float | None = typer.Option(None, "--confidence-threshold"),
+    serve: bool = typer.Option(
+        False,
+        "--serve",
+        help="Start LAN transcript server alongside recording.",
+    ),
+    bind: str | None = typer.Option(
+        None,
+        "--bind",
+        help="Bind address used when --serve is enabled.",
+    ),
+    port: int | None = typer.Option(
+        None,
+        "--port",
+        help="HTTP port used when --serve is enabled.",
+    ),
+    qr: bool = typer.Option(
+        False,
+        "--qr",
+        help="Print an ASCII QR code when --serve is enabled.",
+    ),
     model_dir_faster_whisper: Path | None = typer.Option(
         None,
         "--model-dir-faster-whisper",
@@ -179,6 +204,11 @@ def start_command(
         help="Optional local model directory override for whisper.cpp.",
     ),
 ) -> None:
+    if not serve and (bind is not None or port is not None or qr):
+        raise typer.BadParameter(
+            "`--bind`, `--port`, and `--qr` require `--serve` with `narada start`."
+        )
+
     overrides = ConfigOverrides(
         mode=mode,
         mic=mic,
@@ -195,6 +225,8 @@ def start_command(
         gate=gate,
         gate_threshold_db=gate_threshold_db,
         confidence_threshold=confidence_threshold,
+        bind=bind,
+        port=port,
         model_dir_faster_whisper=model_dir_faster_whisper,
         model_dir_whisper_cpp=model_dir_whisper_cpp,
     )
@@ -250,12 +282,27 @@ def start_command(
 
     started_at = time.time()
     warned_missing_engine_for_audio = False
+    running_server: RunningTranscriptServer | None = None
     mic_capture = None
     system_capture = None
     mixed_resync_state = DriftResyncState()
     performance = RuntimePerformance()
     stopped_by_user = False
     try:
+        if serve:
+            try:
+                running_server = start_transcript_server(config.out, config.bind, config.port)
+            except OSError as exc:
+                raise typer.BadParameter(
+                    f"Unable to start server on {config.bind}:{config.port}: {exc}"
+                ) from exc
+            typer.echo(f"Serving transcript from {config.out}")
+            typer.echo(f"URL: {running_server.access_url}")
+            if config.bind == "0.0.0.0":
+                typer.echo("Warning: server bound to all interfaces on local network.")
+            if qr:
+                typer.echo(render_ascii_qr(running_server.access_url))
+
         with TranscriptWriter(config.out) as writer:
             audio_chunker = OverlapChunker(chunk_duration_s=6.0, overlap_duration_s=1.5)
             if sys.stdin.isatty():
@@ -445,6 +492,8 @@ def start_command(
             mic_capture.close()
         if system_capture is not None:
             system_capture.close()
+        if running_server is not None:
+            running_server.stop()
     if stopped_by_user:
         typer.echo("\nStopped.")
 

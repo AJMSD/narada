@@ -20,6 +20,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - Software mixed mode target (mic + system in Narada).
 - Core PII redaction support (excluding names).
 - Append-only transcript writing with frequent flush and fsync.
+- Optional LAN serving directly from `narada start --serve`.
 - LAN live view endpoints:
   - `/` browser page
   - `/transcript.txt` raw transcript file
@@ -100,6 +101,16 @@ Start a session:
 narada start --mode mic --mic 1 --out ./transcripts/session.txt --language auto
 ```
 
+Start mixed mode with different microphone and system-output devices:
+```bash
+narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt
+```
+
+Start and serve live transcript in one command:
+```bash
+narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --serve --bind 0.0.0.0 --port 8787 --qr
+```
+
 Enable debug logging:
 ```bash
 narada --debug --log-file ./logs/narada.log start --mode mic --mic 1
@@ -129,7 +140,7 @@ Structured stdin for `start` (useful for tests or automation):
 ## Privacy And Security Behavior
 - No telemetry by default.
 - No cloud upload by default.
-- LAN serving is opt-in and only active when running `narada serve`.
+- LAN serving is opt-in and active only when running `narada serve` or `narada start --serve`.
 - Binding to `0.0.0.0` prints a warning because local-network devices can access the endpoint.
 - Redaction does not attempt named-entity inference, and personal names are intentionally not masked.
 

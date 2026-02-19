@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from typer.testing import CliRunner
+
 from narada.asr.base import AsrEngine, TranscriptionRequest, TranscriptSegment
 from narada.asr.model_discovery import StartModelPreflight
 from narada.audio.capture import CapturedFrame
-from narada.cli import start_command
+from narada.cli import app, start_command
 from narada.config import RuntimeConfig
 from narada.devices import AudioDevice
 
@@ -29,6 +31,15 @@ class _FakeCapture:
 
     def close(self) -> None:
         self.closed = True
+
+
+@dataclass
+class _FakeRunningServer:
+    access_url: str = "http://127.0.0.1:8787"
+    stopped: bool = False
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
 class _FakeEngine(AsrEngine):
@@ -230,3 +241,56 @@ def test_start_falls_back_to_recommended_engine(monkeypatch: Any, tmp_path: Path
 
     assert selected_engine_name["value"] == "whisper-cpp"
     assert "fallback transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_with_serve_launches_and_stops_server(monkeypatch: Any, tmp_path: Path) -> None:
+    out_path = tmp_path / "served.txt"
+    cfg = _runtime_config("mic", out_path)
+    fake_engine = _FakeEngine("served transcript")
+    mic_capture = _FakeCapture(frames=[_frame()])
+    fake_server = _FakeRunningServer()
+    calls: dict[str, Any] = {}
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr(
+        "narada.cli.time.sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt)
+    )
+
+    def _start_server(transcript_path: Path, bind: str, port: int) -> _FakeRunningServer:
+        calls["transcript_path"] = transcript_path
+        calls["bind"] = bind
+        calls["port"] = port
+        return fake_server
+
+    monkeypatch.setattr("narada.cli.start_transcript_server", _start_server)
+    monkeypatch.setattr("narada.cli.render_ascii_qr", lambda _url: "QR")
+
+    start_command(serve=True, qr=True)
+    assert calls["transcript_path"] == out_path
+    assert calls["bind"] == cfg.bind
+    assert calls["port"] == cfg.port
+    assert fake_server.stopped
+
+
+def test_start_rejects_serve_options_without_serve() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["start", "--bind", "127.0.0.1"])
+    assert result.exit_code != 0
+    assert "require `--serve`" in result.output.lower()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -170,27 +171,60 @@ def render_ascii_qr(url: str) -> str:
     return "\n".join(lines)
 
 
+@dataclass
+class RunningTranscriptServer:
+    server: TranscriptHTTPServer
+    thread: threading.Thread
+    stop_event: threading.Event
+    access_url: str
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2.0)
+
+
+def start_transcript_server(
+    transcript_path: Path,
+    bind: str,
+    port: int,
+) -> RunningTranscriptServer:
+    stop_event = threading.Event()
+    server = TranscriptHTTPServer((bind, port), TranscriptHandler, transcript_path, stop_event)
+    access_url = build_access_url(bind, int(server.server_address[1]))
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.5},
+        daemon=True,
+    )
+    thread.start()
+    return RunningTranscriptServer(
+        server=server,
+        thread=thread,
+        stop_event=stop_event,
+        access_url=access_url,
+    )
+
+
 def serve_transcript_file(
     transcript_path: Path,
     bind: str,
     port: int,
     show_qr: bool,
 ) -> None:
-    stop_event = threading.Event()
-    server = TranscriptHTTPServer((bind, port), TranscriptHandler, transcript_path, stop_event)
-    access_url = build_access_url(bind, port)
+    running_server = start_transcript_server(transcript_path, bind, port)
     print(f"Serving transcript from {transcript_path}")
-    print(f"URL: {access_url}")
+    print(f"URL: {running_server.access_url}")
     if bind == "0.0.0.0":
         print("Warning: server bound to all interfaces on local network.")
     if show_qr:
-        print(render_ascii_qr(access_url))
+        print(render_ascii_qr(running_server.access_url))
 
     try:
-        server.serve_forever(poll_interval=0.5)
+        while running_server.thread.is_alive():
+            running_server.thread.join(timeout=0.5)
     except KeyboardInterrupt:
         pass
     finally:
-        stop_event.set()
-        server.shutdown()
-        server.server_close()
+        running_server.stop()

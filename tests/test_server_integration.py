@@ -5,7 +5,7 @@ import threading
 import urllib.request
 from pathlib import Path
 
-from narada.server import TranscriptHandler, TranscriptHTTPServer
+from narada.server import TranscriptHandler, TranscriptHTTPServer, start_transcript_server
 
 
 def _start_server(transcript_path: Path) -> tuple[TranscriptHTTPServer, threading.Thread]:
@@ -57,3 +57,20 @@ def test_sse_endpoint_streams_transcript_lines(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_start_transcript_server_helper_starts_and_stops(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.txt"
+    transcript_path.write_text("line-one\n", encoding="utf-8")
+    running = start_transcript_server(
+        transcript_path=transcript_path,
+        bind="127.0.0.1",
+        port=0,
+    )
+    try:
+        assert running.access_url.startswith("http://127.0.0.1:")
+        with urllib.request.urlopen(f"{running.access_url}/transcript.txt", timeout=5) as response:
+            body = response.read().decode("utf-8")
+        assert "line-one" in body
+    finally:
+        running.stop()
