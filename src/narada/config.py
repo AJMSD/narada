@@ -37,6 +37,8 @@ ENV_KEYS: dict[str, str] = {
     "confidence_threshold": "NARADA_CONFIDENCE_THRESHOLD",
     "bind": "NARADA_BIND",
     "port": "NARADA_PORT",
+    "model_dir_faster_whisper": "NARADA_MODEL_DIR_FASTER_WHISPER",
+    "model_dir_whisper_cpp": "NARADA_MODEL_DIR_WHISPER_CPP",
 }
 
 LANGUAGE_ALIASES: dict[str, str] = {
@@ -83,6 +85,8 @@ class RuntimeConfig:
     confidence_threshold: float
     bind: str
     port: int
+    model_dir_faster_whisper: Path | None
+    model_dir_whisper_cpp: Path | None
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,8 @@ class ConfigOverrides:
     confidence_threshold: float | None = None
     bind: str | None = None
     port: int | None = None
+    model_dir_faster_whisper: Path | None = None
+    model_dir_whisper_cpp: Path | None = None
 
 
 def default_output_path(now: datetime | None = None) -> Path:
@@ -162,6 +168,14 @@ def _choose_path(cli_value: Path | None, env_value: str | None) -> Path:
     if env_value:
         return Path(env_value)
     return default_output_path()
+
+
+def _choose_optional_path(cli_value: Path | None, env_value: str | None) -> Path | None:
+    if cli_value is not None:
+        return cli_value
+    if env_value:
+        return Path(env_value)
+    return None
 
 
 def _parse_on_off(raw_value: str, field_name: str) -> bool:
@@ -306,6 +320,15 @@ def build_runtime_config(
     if mode in {"system", "mixed"} and not system:
         raise ConfigError("Mode requires --system (or NARADA_SYSTEM).")
 
+    model_dir_faster_whisper = _choose_optional_path(
+        overrides.model_dir_faster_whisper,
+        env_values.get("model_dir_faster_whisper"),
+    )
+    model_dir_whisper_cpp = _choose_optional_path(
+        overrides.model_dir_whisper_cpp,
+        env_values.get("model_dir_whisper_cpp"),
+    )
+
     return RuntimeConfig(
         mode=mode,
         mic=mic,
@@ -324,4 +347,6 @@ def build_runtime_config(
         confidence_threshold=confidence_threshold,
         bind=bind,
         port=port,
+        model_dir_faster_whisper=model_dir_faster_whisper,
+        model_dir_whisper_cpp=model_dir_whisper_cpp,
     )

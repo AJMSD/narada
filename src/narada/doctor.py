@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from narada.asr.base import build_engine
+from narada.asr.model_discovery import discover_models
 from narada.audio.backends import linux, macos, windows
 from narada.devices import AudioDevice, enumerate_devices
 
@@ -29,17 +30,78 @@ def _python_check() -> DoctorCheck:
 
 
 def _engine_checks() -> list[DoctorCheck]:
-    checks: list[DoctorCheck] = []
+    availability: dict[str, bool] = {}
     for engine_name in ("faster-whisper", "whisper-cpp"):
         engine = build_engine(engine_name)
-        available = engine.is_available()
-        checks.append(
-            DoctorCheck(
-                name=f"ASR engine: {engine_name}",
-                status=_status(available),
-                message="Available" if available else "Not installed in current environment",
+        availability[engine_name] = engine.is_available()
+
+    checks: list[DoctorCheck] = []
+    any_available = any(availability.values())
+    for engine_name in ("faster-whisper", "whisper-cpp"):
+        available = availability[engine_name]
+        if available:
+            status = "PASS"
+            message = "Available"
+        elif any_available:
+            status = "INFO"
+            message = (
+                "Not installed in current environment (optional while another engine is available)"
             )
+        else:
+            status = "WARN"
+            message = "Not installed in current environment"
+        checks.append(
+            DoctorCheck(name=f"ASR engine: {engine_name}", status=status, message=message)
         )
+    return checks
+
+
+def _model_checks(
+    model_name: str,
+    faster_whisper_model_dir: Path | None,
+    whisper_cpp_model_dir: Path | None,
+) -> list[DoctorCheck]:
+    discovery = discover_models(
+        model_name,
+        faster_whisper_model_dir=faster_whisper_model_dir,
+        whisper_cpp_model_dir=whisper_cpp_model_dir,
+    )
+    checks: list[DoctorCheck] = []
+    any_present = discovery.any_present
+
+    for item in (discovery.faster_whisper, discovery.whisper_cpp):
+        if item.present:
+            checks.append(
+                DoctorCheck(
+                    name=f"Model ({item.engine}:{item.model_name})",
+                    status="PASS",
+                    message=f"Found at {item.model_path}",
+                )
+            )
+        else:
+            status = "INFO" if any_present else "WARN"
+            checks.append(
+                DoctorCheck(
+                    name=f"Model ({item.engine}:{item.model_name})",
+                    status=status,
+                    message=(
+                        f"Missing at {item.model_path}. "
+                        f"Download: {item.model_url} | Setup: {item.setup_url}"
+                    ),
+                )
+            )
+
+    checks.append(
+        DoctorCheck(
+            name="Model readiness",
+            status="PASS" if any_present else "WARN",
+            message=(
+                "At least one model is available for local transcription."
+                if any_present
+                else "No local model files detected. Download at least one model."
+            ),
+        )
+    )
     return checks
 
 
@@ -104,9 +166,21 @@ def os_access_write(path: Path) -> bool:
         return False
 
 
-def run_doctor(output_path: Path | None = None) -> list[DoctorCheck]:
+def run_doctor(
+    output_path: Path | None = None,
+    model_name: str = "small",
+    faster_whisper_model_dir: Path | None = None,
+    whisper_cpp_model_dir: Path | None = None,
+) -> list[DoctorCheck]:
     devices = enumerate_devices()
     checks = [_python_check(), _device_check(devices), _audio_probe(devices), *_engine_checks()]
+    checks.extend(
+        _model_checks(
+            model_name,
+            faster_whisper_model_dir=faster_whisper_model_dir,
+            whisper_cpp_model_dir=whisper_cpp_model_dir,
+        )
+    )
     checks.append(_path_check(output_path))
     if platform.system().lower() == "darwin":
         has_blackhole = any("blackhole" in device.name.lower() for device in devices)

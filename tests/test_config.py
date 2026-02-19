@@ -41,3 +41,15 @@ def test_language_aliases_are_normalized() -> None:
 def test_mode_requires_device_selectors() -> None:
     with pytest.raises(ConfigError):
         build_runtime_config(ConfigOverrides(mode="mixed", mic="1"), env={})
+
+
+def test_model_directory_overrides_are_loaded() -> None:
+    env = {
+        "NARADA_MODE": "mic",
+        "NARADA_MIC": "1",
+        "NARADA_MODEL_DIR_FASTER_WHISPER": "C:/models/fw",
+        "NARADA_MODEL_DIR_WHISPER_CPP": "C:/models/wc",
+    }
+    config = build_runtime_config(ConfigOverrides(), env=env)
+    assert config.model_dir_faster_whisper == Path("C:/models/fw")
+    assert config.model_dir_whisper_cpp == Path("C:/models/wc")

@@ -17,6 +17,7 @@ from narada.asr.base import (
     TranscriptSegment,
     build_engine,
 )
+from narada.asr.model_discovery import build_start_model_preflight, discover_models
 from narada.audio.capture import (
     CaptureError,
     DeviceDisconnectedError,
@@ -40,6 +41,7 @@ from narada.devices import (
 )
 from narada.doctor import format_doctor_report, has_failures, run_doctor
 from narada.logging_setup import setup_logging
+from narada.performance import RuntimePerformance
 from narada.pipeline import AudioChunkWindow, ConfidenceGate, OverlapChunker
 from narada.redaction import redact_text
 from narada.server import serve_transcript_file
@@ -84,9 +86,14 @@ def _transcribe_windows(
     *,
     engine_instance: AsrEngine,
     config: RuntimeConfig,
-) -> list[TranscriptSegment]:
+) -> tuple[list[TranscriptSegment], float, float]:
     segments: list[TranscriptSegment] = []
+    audio_seconds = 0.0
+    processing_seconds = 0.0
     for window in windows:
+        bytes_per_second = window.sample_rate_hz * window.channels * 2
+        if bytes_per_second > 0:
+            audio_seconds += len(window.pcm_bytes) / bytes_per_second
         request = TranscriptionRequest(
             pcm_bytes=window.pcm_bytes,
             sample_rate_hz=window.sample_rate_hz,
@@ -94,9 +101,11 @@ def _transcribe_windows(
             model=config.model,
             compute=config.compute,
         )
+        started = time.perf_counter()
         result = engine_instance.transcribe(request)
+        processing_seconds += time.perf_counter() - started
         segments.extend(result)
-    return segments
+    return segments, audio_seconds, processing_seconds
 
 
 @app.command("devices")
@@ -149,6 +158,16 @@ def start_command(
     gate: str | None = typer.Option(None, "--gate", help="on|off"),
     gate_threshold_db: float | None = typer.Option(None, "--gate-threshold-db"),
     confidence_threshold: float | None = typer.Option(None, "--confidence-threshold"),
+    model_dir_faster_whisper: Path | None = typer.Option(
+        None,
+        "--model-dir-faster-whisper",
+        help="Optional local model directory override for faster-whisper.",
+    ),
+    model_dir_whisper_cpp: Path | None = typer.Option(
+        None,
+        "--model-dir-whisper-cpp",
+        help="Optional local model directory override for whisper.cpp.",
+    ),
 ) -> None:
     overrides = ConfigOverrides(
         mode=mode,
@@ -166,6 +185,8 @@ def start_command(
         gate=gate,
         gate_threshold_db=gate_threshold_db,
         confidence_threshold=confidence_threshold,
+        model_dir_faster_whisper=model_dir_faster_whisper,
+        model_dir_whisper_cpp=model_dir_whisper_cpp,
     )
 
     try:
@@ -180,10 +201,28 @@ def start_command(
     except DeviceResolutionError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
-    engine_instance = build_engine(config.engine)
+    model_discovery = discover_models(
+        config.model,
+        faster_whisper_model_dir=config.model_dir_faster_whisper,
+        whisper_cpp_model_dir=config.model_dir_whisper_cpp,
+    )
+    preflight = build_start_model_preflight(model_discovery, config.engine)
+    for message in preflight.messages:
+        typer.echo(message)
+
+    selected_engine: str = config.engine
+    if preflight.recommended_engine is not None and preflight.recommended_engine != config.engine:
+        selected_engine = preflight.recommended_engine
+        typer.echo(f"Switching to {selected_engine} based on available local models.")
+
+    engine_instance = build_engine(
+        selected_engine,
+        faster_whisper_model_dir=config.model_dir_faster_whisper,
+        whisper_cpp_model_dir=config.model_dir_whisper_cpp,
+    )
     if not engine_instance.is_available() and sys.stdin.isatty():
         raise typer.BadParameter(
-            f"Selected engine '{config.engine}' is unavailable. "
+            f"Selected engine '{selected_engine}' is unavailable. "
             "Install dependencies or pipe text input for dry run."
         )
 
@@ -193,7 +232,7 @@ def start_command(
     typer.echo(
         "REC "
         + datetime.now().isoformat(timespec="seconds")
-        + f" | mode={config.mode} | model={config.model}"
+        + f" | mode={config.mode} | engine={selected_engine} | model={config.model}"
     )
     typer.echo(f"Writing transcript to: {config.out}")
     if sys.stdin.isatty():
@@ -204,6 +243,7 @@ def start_command(
     mic_capture = None
     system_capture = None
     mixed_resync_state = DriftResyncState()
+    performance = RuntimePerformance()
     stopped_by_user = False
     try:
         with TranscriptWriter(config.out) as writer:
@@ -219,6 +259,7 @@ def start_command(
 
                 try:
                     while True:
+                        cycle_started_at = time.perf_counter()
                         segments: list[TranscriptSegment] = []
                         audio_windows: list[AudioChunkWindow] = []
                         if config.mode == "mic" and mic_capture is not None:
@@ -276,21 +317,27 @@ def start_command(
                                 )
 
                         if audio_windows and engine_available:
-                            segments.extend(
-                                _transcribe_windows(
-                                    audio_windows,
-                                    engine_instance=engine_instance,
-                                    config=config,
-                                )
+                            window_segments, audio_s, processing_s = _transcribe_windows(
+                                audio_windows,
+                                engine_instance=engine_instance,
+                                config=config,
                             )
+                            performance.record_transcription(
+                                audio_seconds=audio_s,
+                                processing_seconds=processing_s,
+                            )
+                            segments.extend(window_segments)
 
                         committed = gate_state.ingest(segments)
                         for item in committed:
                             text = redact_text(item.text) if config.redact else item.text
                             writer.append_line(text)
+                            performance.record_commit_latency(
+                                elapsed_seconds=time.perf_counter() - cycle_started_at
+                            )
                         typer.echo(
                             f"\rREC {_elapsed(started_at)} | mode={config.mode} "
-                            f"| model={config.model} | rtf=n/a",
+                            f"| model={config.model} | {performance.status_fragment()}",
                             nl=False,
                         )
                         time.sleep(1.0)
@@ -298,6 +345,7 @@ def start_command(
                     stopped_by_user = True
             else:
                 for line in sys.stdin:
+                    cycle_started_at = time.perf_counter()
                     try:
                         parsed = parse_input_line(line, config.mode)
                     except ValueError as exc:
@@ -331,33 +379,51 @@ def start_command(
                                 parsed.audio.sample_rate_hz,
                                 1,
                             )
-                            stdin_segments.extend(
-                                _transcribe_windows(
-                                    audio_windows,
-                                    engine_instance=engine_instance,
-                                    config=config,
-                                )
+                            window_segments, audio_s, processing_s = _transcribe_windows(
+                                audio_windows,
+                                engine_instance=engine_instance,
+                                config=config,
                             )
+                            performance.record_transcription(
+                                audio_seconds=audio_s,
+                                processing_seconds=processing_s,
+                            )
+                            stdin_segments.extend(window_segments)
                     committed = gate_state.ingest(stdin_segments)
                     for item in committed:
                         text = redact_text(item.text) if config.redact else item.text
                         writer.append_line(text)
+                        performance.record_commit_latency(
+                            elapsed_seconds=time.perf_counter() - cycle_started_at
+                        )
 
             remaining_windows = audio_chunker.flush(force=True)
             if remaining_windows and engine_available:
-                tail_segments = _transcribe_windows(
+                tail_segments, audio_s, processing_s = _transcribe_windows(
                     remaining_windows,
                     engine_instance=engine_instance,
                     config=config,
                 )
+                performance.record_transcription(
+                    audio_seconds=audio_s,
+                    processing_seconds=processing_s,
+                )
                 committed_tail = gate_state.ingest(tail_segments)
                 for item in committed_tail:
+                    tail_started_at = time.perf_counter()
                     text = redact_text(item.text) if config.redact else item.text
                     writer.append_line(text)
+                    performance.record_commit_latency(
+                        elapsed_seconds=time.perf_counter() - tail_started_at
+                    )
 
             for pending in gate_state.drain_pending():
+                pending_started_at = time.perf_counter()
                 text = redact_text(pending.text) if config.redact else pending.text
                 writer.append_line(text)
+                performance.record_commit_latency(
+                    elapsed_seconds=time.perf_counter() - pending_started_at
+                )
     except DeviceDisconnectedError as exc:
         typer.echo(f"\nDevice disconnected: {exc}", err=True)
         raise typer.Exit(code=2) from exc
@@ -396,8 +462,39 @@ def doctor_command(
     file: Path | None = typer.Option(
         None, "--file", help="Optional transcript file path to validate."
     ),
+    model: str | None = typer.Option(None, "--model", help="tiny|small|medium|large"),
+    model_dir_faster_whisper: Path | None = typer.Option(
+        None,
+        "--model-dir-faster-whisper",
+        help="Optional local model directory override for faster-whisper.",
+    ),
+    model_dir_whisper_cpp: Path | None = typer.Option(
+        None,
+        "--model-dir-whisper-cpp",
+        help="Optional local model directory override for whisper.cpp.",
+    ),
 ) -> None:
-    checks = run_doctor(file)
+    model_name = (model or os.environ.get("NARADA_MODEL", "small")).strip().lower()
+    checks = run_doctor(
+        output_path=file,
+        model_name=model_name,
+        faster_whisper_model_dir=(
+            model_dir_faster_whisper
+            or (
+                Path(os.environ["NARADA_MODEL_DIR_FASTER_WHISPER"])
+                if "NARADA_MODEL_DIR_FASTER_WHISPER" in os.environ
+                else None
+            )
+        ),
+        whisper_cpp_model_dir=(
+            model_dir_whisper_cpp
+            or (
+                Path(os.environ["NARADA_MODEL_DIR_WHISPER_CPP"])
+                if "NARADA_MODEL_DIR_WHISPER_CPP" in os.environ
+                else None
+            )
+        ),
+    )
     typer.echo(format_doctor_report(checks))
     if has_failures(checks):
         raise typer.Exit(code=1)

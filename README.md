@@ -33,6 +33,23 @@ Select engine with:
 narada start --mode mic --mic 1 --engine faster-whisper
 ```
 
+## Model Setup
+Narada checks local model availability at startup and shows setup guidance when models are missing.
+
+Model sources:
+- faster-whisper: `https://huggingface.co/Systran/faster-whisper-small`
+- whisper.cpp: `https://huggingface.co/ggerganov/whisper.cpp`
+
+Typical local paths on Windows:
+- faster-whisper cache snapshot:
+  - `C:\Users\<you>\.cache\huggingface\hub\models--Systran--faster-whisper-small\...`
+- whisper.cpp model file:
+  - `C:\Users\<you>\AppData\Local\narada\models\whisper-cpp\ggml-small.bin`
+
+One-time setup behavior:
+- If a selected model is missing and another local model family is available, Narada reports that and can run with the available one.
+- Once model files are present locally, runs are offline unless you choose to fetch/update models.
+
 ## Limitations
 - System-audio capture depends on OS and backend support.
 - macOS system capture usually requires a virtual loopback device (for example BlackHole).
@@ -116,6 +133,8 @@ Environment variable map:
 - `NARADA_MODEL` -> `--model`
 - `NARADA_COMPUTE` -> `--compute`
 - `NARADA_ENGINE` -> `--engine`
+- `NARADA_MODEL_DIR_FASTER_WHISPER` -> `--model-dir-faster-whisper`
+- `NARADA_MODEL_DIR_WHISPER_CPP` -> `--model-dir-whisper-cpp`
 - `NARADA_LANGUAGE` -> `--language`
 - `NARADA_ALLOW_MULTILINGUAL` -> `--allow-multilingual`
 - `NARADA_REDACT` -> `--redact`

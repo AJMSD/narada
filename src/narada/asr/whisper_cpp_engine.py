@@ -14,6 +14,7 @@ from threading import Lock
 from typing import ClassVar
 
 from narada.asr.base import EngineUnavailableError, TranscriptionRequest, TranscriptSegment
+from narada.asr.model_discovery import resolve_whisper_cpp_model_path
 
 logger = logging.getLogger("narada.asr.whisper_cpp")
 
@@ -35,9 +36,11 @@ class WhisperCppEngine:
         self,
         which_fn: Callable[[str], str | None] | None = None,
         run_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        model_directory: Path | None = None,
     ) -> None:
         self._which_fn = which_fn or shutil.which
         self._run_fn = run_fn or subprocess.run
+        self._model_directory = model_directory
 
     def is_available(self) -> bool:
         has_python_binding = find_spec("whispercpp") is not None
@@ -123,26 +126,25 @@ class WhisperCppEngine:
             return explicit[0]
         return None
 
-    @staticmethod
-    def _model_directory() -> Path:
-        env_override = os.environ.get("NARADA_WHISPER_CPP_MODEL_DIR")
-        if env_override:
-            return Path(env_override)
-        if os.name == "nt":
-            local_app_data = os.environ.get("LOCALAPPDATA")
-            if local_app_data:
-                return Path(local_app_data) / "narada" / "models" / "whisper-cpp"
-        return Path.home() / ".cache" / "narada" / "models" / "whisper-cpp"
-
-    @classmethod
-    def _resolve_model_path(cls, model_name: str) -> Path:
-        path = cls._model_directory() / f"ggml-{model_name}.bin"
+    def _resolve_model_path(self, model_name: str) -> Path:
+        path = resolve_whisper_cpp_model_path(model_name, self._resolve_model_directory())
         if not path.exists():
             raise EngineUnavailableError(
                 f"whisper.cpp model missing: {path}. "
                 "Download from https://huggingface.co/ggerganov/whisper.cpp"
             )
         return path
+
+    def _resolve_model_directory(self) -> Path | None:
+        if self._model_directory is not None:
+            return self._model_directory
+        modern = os.environ.get("NARADA_MODEL_DIR_WHISPER_CPP")
+        if modern:
+            return Path(modern)
+        legacy = os.environ.get("NARADA_WHISPER_CPP_MODEL_DIR")
+        if legacy:
+            return Path(legacy)
+        return None
 
     @staticmethod
     def _resolve_compute(compute: str) -> int:

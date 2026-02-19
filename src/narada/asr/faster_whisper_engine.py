@@ -3,13 +3,16 @@ from __future__ import annotations
 import array
 import logging
 import math
+import os
 import platform
 from collections.abc import Callable, Sequence
 from importlib.util import find_spec
+from pathlib import Path
 from threading import Lock
 from typing import Any, ClassVar
 
 from narada.asr.base import EngineUnavailableError, TranscriptionRequest, TranscriptSegment
+from narada.asr.model_discovery import resolve_faster_whisper_model_path
 
 logger = logging.getLogger("narada.asr.faster_whisper")
 ModelFactory = Callable[[str, str, str], Any]
@@ -25,9 +28,11 @@ class FasterWhisperEngine:
         self,
         model_factory: ModelFactory | None = None,
         availability_probe: Callable[[], bool] | None = None,
+        model_directory: Path | None = None,
     ) -> None:
         self._model_factory = model_factory or self._default_model_factory
         self._availability_probe = availability_probe or self._default_availability_probe
+        self._model_directory = model_directory
 
     def is_available(self) -> bool:
         return self._availability_probe()
@@ -45,9 +50,10 @@ class FasterWhisperEngine:
             return []
 
         device, compute_type = self.resolve_compute_backend(request.compute)
-        cache_key = (request.model, device, compute_type)
+        model_reference = self._resolve_model_reference(request.model)
+        cache_key = (model_reference, device, compute_type)
         model = self._load_model(
-            model_name=request.model,
+            model_name=model_reference,
             device=device,
             compute_type=compute_type,
             cache_key=cache_key,
@@ -97,6 +103,16 @@ class FasterWhisperEngine:
                 )
             )
         return parsed
+
+    def _resolve_model_reference(self, model_name: str) -> str:
+        explicit_dir = self._model_directory
+        env_dir = os.environ.get("NARADA_MODEL_DIR_FASTER_WHISPER")
+        if explicit_dir is None and env_dir:
+            explicit_dir = Path(env_dir)
+        resolved = resolve_faster_whisper_model_path(model_name, explicit_dir)
+        if resolved.exists():
+            return str(resolved)
+        return model_name
 
     @classmethod
     def clear_cache_for_tests(cls) -> None:
