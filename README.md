@@ -68,6 +68,10 @@ pip install -e ".[dev]"
 ```bash
 pip install -e ".[asr,audio,noise]"
 ```
+Optional alternative (single requirements file with tested optional runtime deps):
+```bash
+pip install -r requirements.txt
+```
 5. Run verification:
 ```powershell
 ./scripts/verify.ps1
