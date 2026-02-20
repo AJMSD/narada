@@ -126,8 +126,8 @@ def _hostapi_rank(hostapi: str | None, *, os_name: str) -> int:
 
 def _device_preference_key(device: AudioDevice, *, os_name: str) -> tuple[int, int, int]:
     return (
-        0 if device.is_default else 1,
         _hostapi_rank(device.hostapi, os_name=os_name),
+        0 if device.is_default else 1,
         device.id,
     )
 

@@ -108,6 +108,131 @@ def test_curate_dedupes_cross_api_and_combines_input_output() -> None:
     assert device.system_device_id == 21
 
 
+def test_curate_wasapi_beats_mme_default_on_windows() -> None:
+    """WASAPI endpoint must win deduplication even when the MME endpoint is the OS default.
+
+    This is the real-world regression: sounddevice reports the Windows system
+    default as an MME device index.  The curated list must expose the WASAPI
+    ID so that WasapiSettings(loopback=True) is valid for system capture.
+    """
+    raw = [
+        AudioDevice(
+            id=7,
+            name="Speakers (2- Realtek(R) Audio)",
+            type="output",
+            is_default=True,  # Windows system default — but it is MME
+            hostapi="MME",
+            system_device_id=7,
+            system_device_type="output",
+        ),
+        AudioDevice(
+            id=19,
+            name="Speakers (2- Realtek(R) Audio)",
+            type="output",
+            hostapi="Windows DirectSound",
+            system_device_id=19,
+            system_device_type="output",
+        ),
+        AudioDevice(
+            id=22,
+            name="Speakers (2- Realtek(R) Audio)",
+            type="output",
+            hostapi="Windows WASAPI",
+            system_device_id=22,
+            system_device_type="output",
+        ),
+    ]
+    curated = curate_devices(raw, os_name="windows")
+    assert len(curated) == 1
+    assert curated[0].id == 22
+    assert curated[0].system_device_id == 22
+    assert curated[0].type == "output"
+
+
+def test_curate_wasapi_default_still_wins_over_mme_default() -> None:
+    """When both MME and WASAPI endpoints are marked default, WASAPI still wins."""
+    raw = [
+        AudioDevice(
+            id=5,
+            name="Headphones (Realtek Audio)",
+            type="output",
+            is_default=True,
+            hostapi="MME",
+            system_device_id=5,
+            system_device_type="output",
+        ),
+        AudioDevice(
+            id=20,
+            name="Headphones (Realtek Audio)",
+            type="output",
+            is_default=True,
+            hostapi="Windows WASAPI",
+            system_device_id=20,
+            system_device_type="output",
+        ),
+    ]
+    curated = curate_devices(raw, os_name="windows")
+    assert len(curated) == 1
+    assert curated[0].id == 20
+
+
+def test_curate_prefers_wasapi_over_directsound_over_mme() -> None:
+    """Host API ranking: WASAPI (0) > DirectSound (2) > MME (4) on Windows."""
+    raw = [
+        AudioDevice(
+            id=1,
+            name="Microphone (Fifine)",
+            type="input",
+            hostapi="MME",
+            input_device_id=1,
+        ),
+        AudioDevice(
+            id=15,
+            name="Microphone (Fifine)",
+            type="input",
+            hostapi="Windows DirectSound",
+            input_device_id=15,
+        ),
+        AudioDevice(
+            id=26,
+            name="Microphone (Fifine)",
+            type="input",
+            hostapi="Windows WASAPI",
+            input_device_id=26,
+        ),
+    ]
+    curated = curate_devices(raw, os_name="windows")
+    assert len(curated) == 1
+    assert curated[0].id == 26
+
+
+def test_curate_is_default_breaks_ties_within_same_api() -> None:
+    """When two endpoints share the same host API, the default one is preferred."""
+    raw = [
+        AudioDevice(
+            id=20,
+            name="Headphones (Realtek)",
+            type="output",
+            is_default=False,
+            hostapi="Windows WASAPI",
+            system_device_id=20,
+            system_device_type="output",
+        ),
+        AudioDevice(
+            id=21,
+            name="Headphones (Realtek)",
+            type="output",
+            is_default=True,
+            hostapi="Windows WASAPI",
+            system_device_id=21,
+            system_device_type="output",
+        ),
+    ]
+    curated = curate_devices(raw, os_name="windows")
+    assert len(curated) == 1
+    assert curated[0].id == 21
+
+
 def test_curate_does_not_combine_ambiguous_bridge_groups() -> None:
     raw = [
         AudioDevice(
