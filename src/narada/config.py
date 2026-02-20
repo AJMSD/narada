@@ -35,6 +35,8 @@ ENV_KEYS: dict[str, str] = {
     "gate": "NARADA_GATE",
     "gate_threshold_db": "NARADA_GATE_THRESHOLD_DB",
     "confidence_threshold": "NARADA_CONFIDENCE_THRESHOLD",
+    "wall_flush_seconds": "NARADA_WALL_FLUSH_SECONDS",
+    "capture_queue_warn_seconds": "NARADA_CAPTURE_QUEUE_WARN_SECONDS",
     "bind": "NARADA_BIND",
     "port": "NARADA_PORT",
     "model_dir_faster_whisper": "NARADA_MODEL_DIR_FASTER_WHISPER",
@@ -83,6 +85,8 @@ class RuntimeConfig:
     gate: bool
     gate_threshold_db: float
     confidence_threshold: float
+    wall_flush_seconds: float
+    capture_queue_warn_seconds: float
     bind: str
     port: int
     model_dir_faster_whisper: Path | None
@@ -106,6 +110,8 @@ class ConfigOverrides:
     gate: str | None = None
     gate_threshold_db: float | None = None
     confidence_threshold: float | None = None
+    wall_flush_seconds: float | None = None
+    capture_queue_warn_seconds: float | None = None
     bind: str | None = None
     port: int | None = None
     model_dir_faster_whisper: Path | None = None
@@ -287,6 +293,20 @@ def build_runtime_config(
         env_values.get("confidence_threshold"),
         "0.65",
     )
+    wall_flush_seconds_raw = _choose_string(
+        str(overrides.wall_flush_seconds) if overrides.wall_flush_seconds is not None else None,
+        env_values.get("wall_flush_seconds"),
+        "60.0",
+    )
+    capture_queue_warn_seconds_raw = _choose_string(
+        (
+            str(overrides.capture_queue_warn_seconds)
+            if overrides.capture_queue_warn_seconds is not None
+            else None
+        ),
+        env_values.get("capture_queue_warn_seconds"),
+        "120.0",
+    )
     bind = _choose_string(overrides.bind, env_values.get("bind"), "0.0.0.0")
     port_raw = _choose_string(
         str(overrides.port) if overrides.port is not None else None,
@@ -303,9 +323,23 @@ def build_runtime_config(
         confidence_threshold = float(confidence_raw)
     except ValueError as exc:
         raise ConfigError(f"Invalid confidence threshold: '{confidence_raw}'.") from exc
+    try:
+        wall_flush_seconds = float(wall_flush_seconds_raw)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid wall flush interval: '{wall_flush_seconds_raw}'.") from exc
+    try:
+        capture_queue_warn_seconds = float(capture_queue_warn_seconds_raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"Invalid capture queue warning threshold: '{capture_queue_warn_seconds_raw}'."
+        ) from exc
 
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ConfigError("Confidence threshold must be between 0.0 and 1.0.")
+    if wall_flush_seconds < 0.0:
+        raise ConfigError("Wall flush seconds must be >= 0.0.")
+    if capture_queue_warn_seconds <= 0.0:
+        raise ConfigError("Capture queue warning threshold must be > 0.0.")
 
     try:
         port = int(port_raw)
@@ -345,6 +379,8 @@ def build_runtime_config(
         gate=gate,
         gate_threshold_db=gate_threshold_db,
         confidence_threshold=confidence_threshold,
+        wall_flush_seconds=wall_flush_seconds,
+        capture_queue_warn_seconds=capture_queue_warn_seconds,
         bind=bind,
         port=port,
         model_dir_faster_whisper=model_dir_faster_whisper,

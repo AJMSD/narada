@@ -20,6 +20,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - Shared logical IDs for combo devices; Narada auto-selects input/output endpoint by command context.
 - `--language auto` default with multilingual input support through comma-separated values.
 - Software mixed mode target (mic + system in Narada).
+- Continuous live capture for mic/system modes with wall-clock forced flush controls.
 - Core PII redaction support (excluding names).
 - Append-only transcript writing with frequent flush and fsync.
 - Automatic hardware channel count detection for system capture; stereo WASAPI loopback devices are opened at their native channel count and downmixed to mono before ASR. If the detected count is rejected by the driver, Narada retries automatically through common fallback values (2, 1) before raising an error.
@@ -116,6 +117,11 @@ Start and serve live transcript in one command:
 narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --serve --bind 0.0.0.0 --port 8787 --qr
 ```
 
+Tune live wall-clock flush and capture backlog warnings:
+```bash
+narada start --mode system --system 7 --out ./transcripts/session.txt --wall-flush-seconds 60 --capture-queue-warn-seconds 120
+```
+
 Enable debug logging:
 ```bash
 narada --debug --log-file ./logs/narada.log start --mode mic --mic 1
@@ -177,5 +183,7 @@ Environment variable map:
 - `NARADA_GATE` -> `--gate`
 - `NARADA_GATE_THRESHOLD_DB` -> `--gate-threshold-db`
 - `NARADA_CONFIDENCE_THRESHOLD` -> `--confidence-threshold`
+- `NARADA_WALL_FLUSH_SECONDS` -> `--wall-flush-seconds`
+- `NARADA_CAPTURE_QUEUE_WARN_SECONDS` -> `--capture-queue-warn-seconds`
 - `NARADA_BIND` -> `--bind`
 - `NARADA_PORT` -> `--port`

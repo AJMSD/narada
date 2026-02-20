@@ -26,6 +26,8 @@ def test_default_output_path_is_generated_when_missing() -> None:
     assert isinstance(config.out, Path)
     assert config.out.name.startswith("narada-")
     assert config.out.suffix == ".txt"
+    assert config.wall_flush_seconds == 60.0
+    assert config.capture_queue_warn_seconds == 120.0
 
 
 def test_multilingual_requires_explicit_flag() -> None:
@@ -53,3 +55,26 @@ def test_model_directory_overrides_are_loaded() -> None:
     config = build_runtime_config(ConfigOverrides(), env=env)
     assert config.model_dir_faster_whisper == Path("C:/models/fw")
     assert config.model_dir_whisper_cpp == Path("C:/models/wc")
+
+
+def test_wall_flush_and_queue_warning_threshold_loaded_from_env() -> None:
+    env = {
+        "NARADA_MODE": "mic",
+        "NARADA_MIC": "1",
+        "NARADA_WALL_FLUSH_SECONDS": "30.0",
+        "NARADA_CAPTURE_QUEUE_WARN_SECONDS": "15.0",
+    }
+    config = build_runtime_config(ConfigOverrides(), env=env)
+    assert config.wall_flush_seconds == 30.0
+    assert config.capture_queue_warn_seconds == 15.0
+
+
+def test_wall_flush_and_queue_warning_threshold_validate_ranges() -> None:
+    env = {
+        "NARADA_MODE": "mic",
+        "NARADA_MIC": "1",
+    }
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(wall_flush_seconds=-1.0), env=env)
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(capture_queue_warn_seconds=0.0), env=env)

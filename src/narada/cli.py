@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import sys
+import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -19,7 +22,9 @@ from narada.asr.base import (
 )
 from narada.asr.model_discovery import build_start_model_preflight, discover_models
 from narada.audio.capture import (
+    CapturedFrame,
     CaptureError,
+    CaptureHandle,
     DeviceDisconnectedError,
     open_mic_capture,
     open_system_capture,
@@ -55,6 +60,7 @@ from narada.writer import TranscriptWriter
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Narada local transcript CLI.")
 logger = logging.getLogger("narada.cli")
+_BACKLOG_WARNING_INTERVAL_S = 30.0
 
 
 @app.callback()
@@ -133,6 +139,118 @@ def _transcribe_windows(
     return segments, audio_seconds, processing_seconds
 
 
+def _write_committed_lines(
+    *,
+    committed: list[object],
+    writer: TranscriptWriter,
+    config: RuntimeConfig,
+    performance: RuntimePerformance,
+    started_at: float,
+) -> None:
+    for item in committed:
+        text = cast(str, getattr(item, "text", "")).strip()
+        if not text:
+            continue
+        if config.redact:
+            text = redact_text(text)
+        writer.append_line(text)
+        performance.record_commit_latency(elapsed_seconds=time.perf_counter() - started_at)
+
+
+def _transcribe_audio_windows(
+    *,
+    audio_windows: list[AudioChunkWindow],
+    engine_available: bool,
+    engine_instance: AsrEngine,
+    config: RuntimeConfig,
+    performance: RuntimePerformance,
+    gate_state: ConfidenceGate,
+    writer: TranscriptWriter,
+    started_at: float,
+) -> None:
+    if not audio_windows or not engine_available:
+        return
+    segments, audio_s, processing_s = _transcribe_windows(
+        audio_windows,
+        engine_instance=engine_instance,
+        config=config,
+    )
+    performance.record_transcription(
+        audio_seconds=audio_s,
+        processing_seconds=processing_s,
+    )
+    committed = gate_state.ingest(segments)
+    _write_committed_lines(
+        committed=cast(list[object], committed),
+        writer=writer,
+        config=config,
+        performance=performance,
+        started_at=started_at,
+    )
+
+
+def _capture_worker_loop(
+    *,
+    source_name: str,
+    capture_handle: CaptureHandle,
+    frame_queue: queue.Queue[CapturedFrame],
+    stop_event: threading.Event,
+    error_queue: queue.Queue[tuple[str, Exception]],
+) -> None:
+    while not stop_event.is_set():
+        try:
+            frame = capture_handle.read_frame()
+        except Exception as exc:  # pragma: no cover - OS/backend-specific at runtime
+            error_queue.put((source_name, exc))
+            stop_event.set()
+            return
+        if frame is not None:
+            frame_queue.put(frame)
+
+
+def _estimate_capture_backlog_seconds(
+    *,
+    queued_frames: int,
+    blocksize: int,
+    sample_rate_hz: int,
+) -> float:
+    if queued_frames <= 0:
+        return 0.0
+    if blocksize <= 0 or sample_rate_hz <= 0:
+        return 0.0
+    return queued_frames * (blocksize / sample_rate_hz)
+
+
+def _maybe_warn_capture_backlog(
+    *,
+    source_name: str,
+    queued_frames: int,
+    blocksize: int,
+    sample_rate_hz: int,
+    warn_threshold_s: float,
+    now_monotonic: float,
+    last_warned_at: float | None,
+) -> float | None:
+    backlog_s = _estimate_capture_backlog_seconds(
+        queued_frames=queued_frames,
+        blocksize=blocksize,
+        sample_rate_hz=sample_rate_hz,
+    )
+    if backlog_s < warn_threshold_s:
+        return last_warned_at
+    if last_warned_at is not None and (
+        now_monotonic - last_warned_at < _BACKLOG_WARNING_INTERVAL_S
+    ):
+        return last_warned_at
+    message = (
+        f"Warning: {source_name} capture backlog is {backlog_s:.1f}s "
+        f"({queued_frames} queued frames). ASR may be falling behind."
+    )
+    logger.warning(message)
+    _safe_echo(message, err=True)
+    return now_monotonic
+
+
 @app.command("devices")
 def devices_command(
     device_type: str | None = typer.Option(None, "--type", help="input|output|loopback|monitor"),
@@ -188,6 +306,16 @@ def start_command(
     gate: str | None = typer.Option(None, "--gate", help="on|off"),
     gate_threshold_db: float | None = typer.Option(None, "--gate-threshold-db"),
     confidence_threshold: float | None = typer.Option(None, "--confidence-threshold"),
+    wall_flush_seconds: float | None = typer.Option(
+        None,
+        "--wall-flush-seconds",
+        help="Force transcript flush/commit at this wall-clock interval in live mode (0 disables).",
+    ),
+    capture_queue_warn_seconds: float | None = typer.Option(
+        None,
+        "--capture-queue-warn-seconds",
+        help="Warn when estimated live capture backlog exceeds this many seconds.",
+    ),
     serve: bool = typer.Option(
         False,
         "--serve",
@@ -240,6 +368,8 @@ def start_command(
         gate=gate,
         gate_threshold_db=gate_threshold_db,
         confidence_threshold=confidence_threshold,
+        wall_flush_seconds=wall_flush_seconds,
+        capture_queue_warn_seconds=capture_queue_warn_seconds,
         bind=bind,
         port=port,
         model_dir_faster_whisper=model_dir_faster_whisper,
@@ -329,14 +459,92 @@ def start_command(
                         all_devices=all_devices,
                     )
 
+                mic_queue: queue.Queue[CapturedFrame] | None = (
+                    queue.Queue() if mic_capture is not None else None
+                )
+                system_queue: queue.Queue[CapturedFrame] | None = (
+                    queue.Queue() if system_capture is not None else None
+                )
+                capture_stop = threading.Event()
+                capture_errors: queue.Queue[tuple[str, Exception]] = queue.Queue()
+                capture_threads: list[threading.Thread] = []
+                if mic_capture is not None and mic_queue is not None:
+                    mic_thread = threading.Thread(
+                        target=_capture_worker_loop,
+                        kwargs={
+                            "source_name": "mic",
+                            "capture_handle": mic_capture,
+                            "frame_queue": mic_queue,
+                            "stop_event": capture_stop,
+                            "error_queue": capture_errors,
+                        },
+                        daemon=True,
+                        name="narada-mic-capture",
+                    )
+                    mic_thread.start()
+                    capture_threads.append(mic_thread)
+                if system_capture is not None and system_queue is not None:
+                    system_thread = threading.Thread(
+                        target=_capture_worker_loop,
+                        kwargs={
+                            "source_name": "system",
+                            "capture_handle": system_capture,
+                            "frame_queue": system_queue,
+                            "stop_event": capture_stop,
+                            "error_queue": capture_errors,
+                        },
+                        daemon=True,
+                        name="narada-system-capture",
+                    )
+                    system_thread.start()
+                    capture_threads.append(system_thread)
+
+                mic_pending: deque[CapturedFrame] = deque()
+                system_pending: deque[CapturedFrame] = deque()
+                next_status_at = time.monotonic()
+                next_flush_deadline: float | None = None
+                if config.wall_flush_seconds > 0.0:
+                    next_flush_deadline = time.monotonic() + config.wall_flush_seconds
+                last_backlog_warning_at: dict[str, float | None] = {
+                    "mic": None,
+                    "system": None,
+                }
+
                 try:
                     while True:
                         cycle_started_at = time.perf_counter()
-                        segments: list[TranscriptSegment] = []
+                        processed_any = False
                         audio_windows: list[AudioChunkWindow] = []
-                        if config.mode == "mic" and mic_capture is not None:
-                            mic_frame = mic_capture.read_frame()
-                            if mic_frame:
+                        try:
+                            source_name, worker_exc = capture_errors.get_nowait()
+                        except queue.Empty:
+                            source_name = ""
+                            worker_exc = None
+                        if worker_exc is not None:
+                            if isinstance(worker_exc, (DeviceDisconnectedError, CaptureError)):
+                                raise worker_exc
+                            raise CaptureError(
+                                f"{source_name} capture failed: {worker_exc}"
+                            ) from worker_exc
+
+                        if mic_queue is not None:
+                            while True:
+                                try:
+                                    mic_pending.append(mic_queue.get_nowait())
+                                except queue.Empty:
+                                    break
+                                processed_any = True
+                        if system_queue is not None:
+                            while True:
+                                try:
+                                    system_pending.append(system_queue.get_nowait())
+                                except queue.Empty:
+                                    break
+                                processed_any = True
+
+                        if config.mode == "mic":
+                            while mic_pending:
+                                mic_frame = mic_pending.popleft()
                                 audio_windows.extend(
                                     audio_chunker.ingest(
                                         mic_frame.pcm_bytes,
@@ -344,9 +552,9 @@ def start_command(
                                         mic_frame.channels,
                                     )
                                 )
-                        elif config.mode == "system" and system_capture is not None:
-                            system_frame = system_capture.read_frame()
-                            if system_frame:
+                        elif config.mode == "system":
+                            while system_pending:
+                                system_frame = system_pending.popleft()
                                 audio_windows.extend(
                                     audio_chunker.ingest(
                                         system_frame.pcm_bytes,
@@ -359,9 +567,9 @@ def start_command(
                             and mic_capture is not None
                             and system_capture is not None
                         ):
-                            mic_frame = mic_capture.read_frame()
-                            system_frame = system_capture.read_frame()
-                            if mic_frame and system_frame:
+                            while mic_pending and system_pending:
+                                mic_frame = mic_pending.popleft()
+                                system_frame = system_pending.popleft()
                                 mixed_samples, mixed_rate = mix_audio_chunks(
                                     AudioChunk(
                                         samples=pcm16le_to_float32(mic_frame.pcm_bytes),
@@ -388,33 +596,78 @@ def start_command(
                                     )
                                 )
 
-                        if audio_windows and engine_available:
-                            window_segments, audio_s, processing_s = _transcribe_windows(
-                                audio_windows,
+                        _transcribe_audio_windows(
+                            audio_windows=audio_windows,
+                            engine_available=engine_available,
+                            engine_instance=engine_instance,
+                            config=config,
+                            performance=performance,
+                            gate_state=gate_state,
+                            writer=writer,
+                            started_at=cycle_started_at,
+                        )
+
+                        now_monotonic = time.monotonic()
+                        if next_flush_deadline is not None and now_monotonic >= next_flush_deadline:
+                            forced_windows: list[AudioChunkWindow] = []
+                            while (
+                                next_flush_deadline is not None
+                                and now_monotonic >= next_flush_deadline
+                            ):
+                                forced_windows.extend(audio_chunker.flush(force=True))
+                                next_flush_deadline += config.wall_flush_seconds
+                            _transcribe_audio_windows(
+                                audio_windows=forced_windows,
+                                engine_available=engine_available,
                                 engine_instance=engine_instance,
                                 config=config,
+                                performance=performance,
+                                gate_state=gate_state,
+                                writer=writer,
+                                started_at=cycle_started_at,
                             )
-                            performance.record_transcription(
-                                audio_seconds=audio_s,
-                                processing_seconds=processing_s,
-                            )
-                            segments.extend(window_segments)
+                            if forced_windows:
+                                processed_any = True
 
-                        committed = gate_state.ingest(segments)
-                        for item in committed:
-                            text = redact_text(item.text) if config.redact else item.text
-                            writer.append_line(text)
-                            performance.record_commit_latency(
-                                elapsed_seconds=time.perf_counter() - cycle_started_at
+                        if mic_capture is not None and mic_queue is not None:
+                            mic_queued_frames = mic_queue.qsize() + len(mic_pending)
+                            last_backlog_warning_at["mic"] = _maybe_warn_capture_backlog(
+                                source_name="mic",
+                                queued_frames=mic_queued_frames,
+                                blocksize=mic_capture.blocksize,
+                                sample_rate_hz=mic_capture.sample_rate_hz,
+                                warn_threshold_s=config.capture_queue_warn_seconds,
+                                now_monotonic=now_monotonic,
+                                last_warned_at=last_backlog_warning_at["mic"],
                             )
-                        typer.echo(
-                            f"\rREC {_elapsed(started_at)} | mode={config.mode} "
-                            f"| model={config.model} | {performance.status_fragment()}",
-                            nl=False,
-                        )
-                        time.sleep(1.0)
+                        if system_capture is not None and system_queue is not None:
+                            system_queued_frames = system_queue.qsize() + len(system_pending)
+                            last_backlog_warning_at["system"] = _maybe_warn_capture_backlog(
+                                source_name="system",
+                                queued_frames=system_queued_frames,
+                                blocksize=system_capture.blocksize,
+                                sample_rate_hz=system_capture.sample_rate_hz,
+                                warn_threshold_s=config.capture_queue_warn_seconds,
+                                now_monotonic=now_monotonic,
+                                last_warned_at=last_backlog_warning_at["system"],
+                            )
+
+                        if now_monotonic >= next_status_at:
+                            typer.echo(
+                                f"\rREC {_elapsed(started_at)} | mode={config.mode} "
+                                f"| model={config.model} | {performance.status_fragment()}",
+                                nl=False,
+                            )
+                            next_status_at = now_monotonic + 1.0
+
+                        if not processed_any:
+                            time.sleep(0.01)
                 except KeyboardInterrupt:
                     stopped_by_user = True
+                finally:
+                    capture_stop.set()
+                    for thread in capture_threads:
+                        thread.join(timeout=1.0)
             else:
                 for line in sys.stdin:
                     cycle_started_at = time.perf_counter()
@@ -462,40 +715,34 @@ def start_command(
                             )
                             stdin_segments.extend(window_segments)
                     committed = gate_state.ingest(stdin_segments)
-                    for item in committed:
-                        text = redact_text(item.text) if config.redact else item.text
-                        writer.append_line(text)
-                        performance.record_commit_latency(
-                            elapsed_seconds=time.perf_counter() - cycle_started_at
-                        )
-
-            remaining_windows = audio_chunker.flush(force=True)
-            if remaining_windows and engine_available:
-                tail_segments, audio_s, processing_s = _transcribe_windows(
-                    remaining_windows,
-                    engine_instance=engine_instance,
-                    config=config,
-                )
-                performance.record_transcription(
-                    audio_seconds=audio_s,
-                    processing_seconds=processing_s,
-                )
-                committed_tail = gate_state.ingest(tail_segments)
-                for item in committed_tail:
-                    tail_started_at = time.perf_counter()
-                    text = redact_text(item.text) if config.redact else item.text
-                    writer.append_line(text)
-                    performance.record_commit_latency(
-                        elapsed_seconds=time.perf_counter() - tail_started_at
+                    _write_committed_lines(
+                        committed=cast(list[object], committed),
+                        writer=writer,
+                        config=config,
+                        performance=performance,
+                        started_at=cycle_started_at,
                     )
 
-            for pending in gate_state.drain_pending():
-                pending_started_at = time.perf_counter()
-                text = redact_text(pending.text) if config.redact else pending.text
-                writer.append_line(text)
-                performance.record_commit_latency(
-                    elapsed_seconds=time.perf_counter() - pending_started_at
-                )
+            remaining_windows = audio_chunker.flush(force=True)
+            _transcribe_audio_windows(
+                audio_windows=remaining_windows,
+                engine_available=engine_available,
+                engine_instance=engine_instance,
+                config=config,
+                performance=performance,
+                gate_state=gate_state,
+                writer=writer,
+                started_at=time.perf_counter(),
+            )
+
+            pending = gate_state.drain_pending()
+            _write_committed_lines(
+                committed=cast(list[object], pending),
+                writer=writer,
+                config=config,
+                performance=performance,
+                started_at=time.perf_counter(),
+            )
     except DeviceDisconnectedError as exc:
         _safe_echo(f"\nDevice disconnected: {exc}", err=True)
         raise typer.Exit(code=2) from exc
