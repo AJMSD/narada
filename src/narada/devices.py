@@ -35,6 +35,8 @@ _HOSTAPI_PRIORITY_BY_OS: dict[str, tuple[str, ...]] = {
     "darwin": ("core audio",),
 }
 
+_WINDOWS_EXCLUDED_HOSTAPI_TOKENS: tuple[str, ...] = ("mme", "directsound")
+
 
 class DeviceResolutionError(ValueError):
     pass
@@ -122,6 +124,13 @@ def _hostapi_rank(hostapi: str | None, *, os_name: str) -> int:
         if item in normalized:
             return rank
     return len(ordered) + 10
+
+
+def _is_excluded_hostapi(device: AudioDevice, *, os_name: str) -> bool:
+    if os_name != "windows":
+        return False
+    hostapi = (device.hostapi or "").lower()
+    return any(token in hostapi for token in _WINDOWS_EXCLUDED_HOSTAPI_TOKENS)
 
 
 def _device_preference_key(device: AudioDevice, *, os_name: str) -> tuple[int, int, int]:
@@ -220,9 +229,14 @@ def _dedupe_endpoints(
     *,
     os_name: str,
 ) -> list[AudioDevice]:
+    eligible_devices = [
+        device
+        for device in devices
+        if not _is_excluded_hostapi(device, os_name=os_name)
+    ]
     deduped_by_key: dict[tuple[str, DeviceType], AudioDevice] = {}
 
-    for device in devices:
+    for device in eligible_devices:
         if _is_alias_or_placeholder_name(device.name, os_name=os_name):
             continue
         key = (_canonical_device_name(device.name), device.type)
@@ -241,7 +255,7 @@ def _dedupe_endpoints(
         deduped.sort(key=_device_sort_key)
         return deduped
 
-    fallback = list(devices)
+    fallback = list(eligible_devices)
     fallback.sort(key=_device_sort_key)
     return fallback
 

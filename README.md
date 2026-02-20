@@ -15,6 +15,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
   - `narada doctor`
 - Device selection by ID or name with fuzzy matching support.
 - Automatic OS-aware device deduplication in `narada devices` (use `--all` for raw endpoints).
+- On Windows, default `narada devices` output excludes legacy MME and DirectSound endpoints before deduplication; use `--all` to inspect raw host-API entries.
 - Shared logical IDs for combo devices; Narada auto-selects input/output endpoint by command context.
 - `--language auto` default with multilingual input support through comma-separated values.
 - Software mixed mode target (mic + system in Narada).
@@ -56,6 +57,7 @@ One-time setup behavior:
 
 ## Limitations
 - System-audio capture depends on OS and backend support. On Windows, WASAPI loopback devices report their channel count at runtime; Narada queries this automatically and downmixes to mono before transcription. If the reported count is rejected, a fallback through common values is attempted.
+- Windows system mode requires a sounddevice/PortAudio build that exposes `WasapiSettings(loopback=True)`. If unavailable, Narada exits with a clear compatibility message.
 - Bluetooth HFP devices (Hands-Free Profile) do not expose a standard PCM loopback endpoint on Windows and will produce a descriptive error. Use a Realtek/USB output device or the built-in **Stereo Mix** input (`narada devices --type input`) for reliable system-audio capture.
 - macOS system capture usually requires a virtual loopback device (for example BlackHole).
 - ASR runtime availability depends on optional dependencies being installed.

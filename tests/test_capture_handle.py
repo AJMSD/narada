@@ -5,10 +5,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from narada.audio.capture import (
+    _PA_INVALID_CHANNELS,
     CaptureError,
     CaptureHandle,
     DeviceDisconnectedError,
-    _PA_INVALID_CHANNELS,
     _downmix_pcm16le_to_mono,
     _open_loopback_stream,
     _query_native_channels,
@@ -258,8 +258,8 @@ def test_open_system_capture_opens_stream_with_native_channel_count(
         selected_device: AudioDevice,
         all_devices: list[AudioDevice],
         os_name: str,
-    ) -> tuple[AudioDevice, None]:
-        return device, None
+    ) -> tuple[AudioDevice, object]:
+        return device, object()
 
     def fake_query(device_id: int, *, loopback: bool = False) -> int:
         return 2
@@ -310,6 +310,24 @@ def test_open_system_capture_mono_device_no_downmix_overhead(
     frame = handle.read_frame()
     assert frame is not None
     assert frame.pcm_bytes == _pack_s16le(999)
+
+
+def test_open_system_capture_windows_requires_loopback_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = AudioDevice(id=5, name="Speakers", type="output")
+
+    monkeypatch.setattr(
+        "narada.audio.capture._resolve_system_backend_device",
+        lambda *a, **kw: (device, None),
+    )
+    monkeypatch.setattr(
+        "narada.audio.capture.windows.loopback_support_error",
+        lambda: "Installed sounddevice does not support WASAPI loopback.",
+    )
+
+    with pytest.raises(CaptureError, match="does not support WASAPI loopback"):
+        open_system_capture(device=device, all_devices=[device], os_name="windows")
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +395,11 @@ class _FakePortAudioError(Exception):
         super().__init__(msg, code)
 
 
-def _make_sd_mock(*, succeed_on: int | None = None, fail_code: int = _PA_INVALID_CHANNELS) -> MagicMock:
+def _make_sd_mock(
+    *,
+    succeed_on: int | None = None,
+    fail_code: int = _PA_INVALID_CHANNELS,
+) -> MagicMock:
     """Return a mock sounddevice module whose PortAudioError matches *fail_code*.
 
     ``succeed_on`` – channel count that opens successfully; None means all fail.
@@ -385,13 +407,14 @@ def _make_sd_mock(*, succeed_on: int | None = None, fail_code: int = _PA_INVALID
     mock_sd = MagicMock()
     mock_sd.PortAudioError = _FakePortAudioError
 
-    call_count: dict[str, int] = {"n": 0}
-
     def fake_raw_input_stream(**kwargs: object) -> MagicMock:
         channels = kwargs["channels"]
         if succeed_on is not None and channels == succeed_on:
             return MagicMock()
-        raise _FakePortAudioError(f"Invalid number of channels [PaErrorCode {fail_code}]", fail_code)
+        raise _FakePortAudioError(
+            f"Invalid number of channels [PaErrorCode {fail_code}]",
+            fail_code,
+        )
 
     mock_sd.RawInputStream = fake_raw_input_stream
     return mock_sd
@@ -444,7 +467,9 @@ def test_open_loopback_stream_falls_back_to_mono(monkeypatch: pytest.MonkeyPatch
     assert opened == 1
 
 
-def test_open_loopback_stream_no_duplicates_when_native_is_1(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_open_loopback_stream_no_duplicates_when_native_is_1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """native=1 means candidates=[1, 2]; if 1 fails, 2 is tried."""
     mock_sd = _make_sd_mock(succeed_on=2)
     monkeypatch.setitem(sys.modules, "sounddevice", mock_sd)

@@ -313,11 +313,25 @@ def open_system_capture(
     blocksize: int = 1600,
     os_name: str | None = None,
 ) -> CaptureHandle:
-    resolved_device, extra_settings = _resolve_system_backend_device(
-        selected_device=device,
-        all_devices=all_devices,
-        os_name=os_name or platform.system().lower(),
-    )
+    normalized_os = (os_name or platform.system().lower()).strip().lower()
+    try:
+        resolved_device, extra_settings = _resolve_system_backend_device(
+            selected_device=device,
+            all_devices=all_devices,
+            os_name=normalized_os,
+        )
+    except DeviceResolutionError as exc:
+        raise CaptureError(str(exc)) from exc
+
+    if normalized_os == "windows" and extra_settings is None:
+        detail = windows.loopback_support_error()
+        if detail is None:
+            detail = (
+                "WASAPI loopback settings are unavailable for the selected Windows "
+                "device."
+            )
+        raise CaptureError(detail)
+
     native_channels = _query_native_channels(resolved_device.id, loopback=True)
     stream, opened_channels = _open_loopback_stream(
         device_id=resolved_device.id,

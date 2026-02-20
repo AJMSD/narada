@@ -266,20 +266,51 @@ def test_curate_filters_alias_devices_but_keeps_fallback_if_all_filtered() -> No
             id=0,
             name="Microsoft Sound Mapper - Input",
             type="input",
-            hostapi="MME",
+            hostapi="Windows WASAPI",
             input_device_id=0,
         ),
         AudioDevice(
             id=1,
             name="Primary Sound Driver",
             type="output",
-            hostapi="MME",
+            hostapi="Windows WASAPI",
             system_device_id=1,
             system_device_type="output",
         ),
     ]
     curated = curate_devices(raw, os_name="windows")
     assert [item.id for item in curated] == [0, 1]
+
+
+def test_curate_windows_filters_mme_and_directsound_before_dedupe() -> None:
+    raw = [
+        AudioDevice(
+            id=8,
+            name="Headphones (2- Realtek(R) Audio",
+            type="output",
+            hostapi="MME",
+            system_device_id=8,
+            system_device_type="output",
+        ),
+        AudioDevice(
+            id=18,
+            name="Headphones (2- Realtek(R) Audio)",
+            type="output",
+            hostapi="Windows DirectSound",
+            system_device_id=18,
+            system_device_type="output",
+        ),
+        AudioDevice(
+            id=20,
+            name="Headphones (2- Realtek(R) Audio)",
+            type="output",
+            hostapi="Windows WASAPI",
+            system_device_id=20,
+            system_device_type="output",
+        ),
+    ]
+    curated = curate_devices(raw, os_name="windows")
+    assert [item.id for item in curated] == [20]
 
 
 def test_enumerate_devices_include_all_returns_raw(monkeypatch: pytest.MonkeyPatch) -> None:

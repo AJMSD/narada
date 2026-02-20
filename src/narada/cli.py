@@ -91,6 +91,21 @@ def _elapsed(started_at: float) -> str:
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
+def _safe_echo(message: str, *, err: bool = False, nl: bool = True) -> None:
+    try:
+        typer.echo(message, err=err, nl=nl)
+    except OSError:
+        fallback_stream = sys.__stderr__ if err else sys.__stdout__
+        if fallback_stream is None:
+            return
+        text = f"{message}\n" if nl else message
+        try:
+            fallback_stream.write(text)
+            fallback_stream.flush()
+        except Exception:
+            return
+
+
 def _transcribe_windows(
     windows: list[AudioChunkWindow],
     *,
@@ -482,10 +497,10 @@ def start_command(
                     elapsed_seconds=time.perf_counter() - pending_started_at
                 )
     except DeviceDisconnectedError as exc:
-        typer.echo(f"\nDevice disconnected: {exc}", err=True)
+        _safe_echo(f"\nDevice disconnected: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     except CaptureError as exc:
-        typer.echo(f"\nAudio capture error: {exc}", err=True)
+        _safe_echo(f"\nAudio capture error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     finally:
         if mic_capture is not None:

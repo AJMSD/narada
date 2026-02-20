@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pytest
+import typer
 from typer.testing import CliRunner
 
 from narada.asr.base import AsrEngine, TranscriptionRequest, TranscriptSegment
 from narada.asr.model_discovery import StartModelPreflight
-from narada.audio.capture import CapturedFrame
+from narada.audio.capture import CapturedFrame, CaptureError
 from narada.cli import app, start_command
 from narada.config import RuntimeConfig
 from narada.devices import AudioDevice
@@ -287,6 +290,53 @@ def test_start_with_serve_launches_and_stops_server(monkeypatch: Any, tmp_path: 
     assert calls["bind"] == cfg.bind
     assert calls["port"] == cfg.port
     assert fake_server.stopped
+
+
+def test_start_capture_error_falls_back_when_stderr_handle_is_invalid(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    out_path = tmp_path / "capture-error.txt"
+    cfg = _runtime_config("system", out_path)
+    fake_engine = _FakeEngine("unused")
+    fallback_err = io.StringIO()
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (None, AudioDevice(22, "Speakers", "output"), []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr(
+        "narada.cli.open_system_capture",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(CaptureError("boom")),
+    )
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.sys.__stderr__", fallback_err)
+
+    original_echo = typer.echo
+
+    def fake_echo(message: object, *args: object, **kwargs: object) -> None:
+        if kwargs.get("err"):
+            raise OSError("Windows error 6")
+        original_echo(message, *args, **kwargs)
+
+    monkeypatch.setattr("narada.cli.typer.echo", fake_echo)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        start_command()
+
+    assert exc_info.value.exit_code == 2
+    assert "Audio capture error: boom" in fallback_err.getvalue()
 
 
 def test_start_rejects_serve_options_without_serve() -> None:

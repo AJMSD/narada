@@ -2,10 +2,13 @@ from narada.audio.backends import linux, macos, windows
 from narada.devices import AudioDevice
 
 
-def test_windows_probe_smoke_reports_mic_and_system_support() -> None:
+def test_windows_probe_smoke_reports_mic_and_system_support(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("narada.audio.backends.windows.loopback_support_error", lambda: None)
     devices = [
         AudioDevice(id=1, name="Mic", type="input"),
-        AudioDevice(id=2, name="Speaker", type="output"),
+        AudioDevice(id=2, name="Speaker", type="output", hostapi="Windows WASAPI"),
     ]
     probe = windows.probe(devices)
     assert probe.backend == "windows"
