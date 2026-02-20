@@ -20,7 +20,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - Software mixed mode target (mic + system in Narada).
 - Core PII redaction support (excluding names).
 - Append-only transcript writing with frequent flush and fsync.
-- Automatic hardware channel count detection for system capture; stereo WASAPI loopback devices are opened at their native channel count and downmixed to mono before ASR.
+- Automatic hardware channel count detection for system capture; stereo WASAPI loopback devices are opened at their native channel count and downmixed to mono before ASR. If the detected count is rejected by the driver, Narada retries automatically through common fallback values (2, 1) before raising an error.
 - Optional LAN serving directly from `narada start --serve`.
 - LAN live view endpoints:
   - `/` browser page
@@ -55,7 +55,8 @@ One-time setup behavior:
 - Once model files are present locally, runs are offline unless you choose to fetch/update models.
 
 ## Limitations
-- System-audio capture depends on OS and backend support. On Windows, WASAPI loopback devices report their channel count at runtime; Narada queries this automatically and downmixes to mono before transcription.
+- System-audio capture depends on OS and backend support. On Windows, WASAPI loopback devices report their channel count at runtime; Narada queries this automatically and downmixes to mono before transcription. If the reported count is rejected, a fallback through common values is attempted.
+- Bluetooth HFP devices (Hands-Free Profile) do not expose a standard PCM loopback endpoint on Windows and will produce a descriptive error. Use a Realtek/USB output device or the built-in **Stereo Mix** input (`narada devices --type input`) for reliable system-audio capture.
 - macOS system capture usually requires a virtual loopback device (for example BlackHole).
 - ASR runtime availability depends on optional dependencies being installed.
 - Current scaffold focuses on stable interfaces, validation, and quality gates while real-time capture integrations are expanded.

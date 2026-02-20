@@ -8,8 +8,11 @@ from narada.audio.capture import (
     CaptureError,
     CaptureHandle,
     DeviceDisconnectedError,
+    _PA_INVALID_CHANNELS,
     _downmix_pcm16le_to_mono,
+    _open_loopback_stream,
     _query_native_channels,
+    _raise_loopback_error,
     open_system_capture,
     pcm16le_to_float32,
 )
@@ -323,3 +326,214 @@ def test_pcm16le_to_float32_handles_boundaries() -> None:
 def test_pcm16le_to_float32_rejects_odd_bytes() -> None:
     with pytest.raises(ValueError):
         pcm16le_to_float32(b"\x00")
+
+
+# ---------------------------------------------------------------------------
+# _raise_loopback_error
+# ---------------------------------------------------------------------------
+
+
+def test_raise_loopback_error_generic_message() -> None:
+    cause = RuntimeError("pa error")
+    with pytest.raises(CaptureError, match="Could not open system capture"):
+        _raise_loopback_error("Speakers (Realtek)", cause)
+
+
+def test_raise_loopback_error_includes_device_name() -> None:
+    cause = RuntimeError("pa error")
+    with pytest.raises(CaptureError, match="Speakers \\(Realtek\\)"):
+        _raise_loopback_error("Speakers (Realtek)", cause)
+
+
+def test_raise_loopback_error_bt_hfp_detected_by_driver_hint() -> None:
+    cause = RuntimeError("pa error")
+    bt_name = "Output 1 (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free%0)"
+    with pytest.raises(CaptureError, match="Bluetooth HFP"):
+        _raise_loopback_error(bt_name, cause)
+
+
+def test_raise_loopback_error_bt_hint_case_insensitive() -> None:
+    cause = RuntimeError("pa error")
+    with pytest.raises(CaptureError, match="Bluetooth HFP"):
+        _raise_loopback_error("Device (BTHHFENUM driver)", cause)
+
+
+def test_raise_loopback_error_chains_cause() -> None:
+    cause = RuntimeError("original")
+    with pytest.raises(CaptureError) as exc_info:
+        _raise_loopback_error("Speakers", cause)
+    assert exc_info.value.__cause__ is cause
+
+
+# ---------------------------------------------------------------------------
+# _open_loopback_stream
+# ---------------------------------------------------------------------------
+
+
+class _FakePortAudioError(Exception):
+    """Minimal stand-in for sounddevice.PortAudioError."""
+
+    def __init__(self, msg: str, code: int) -> None:
+        super().__init__(msg, code)
+
+
+def _make_sd_mock(*, succeed_on: int | None = None, fail_code: int = _PA_INVALID_CHANNELS) -> MagicMock:
+    """Return a mock sounddevice module whose PortAudioError matches *fail_code*.
+
+    ``succeed_on`` – channel count that opens successfully; None means all fail.
+    """
+    mock_sd = MagicMock()
+    mock_sd.PortAudioError = _FakePortAudioError
+
+    call_count: dict[str, int] = {"n": 0}
+
+    def fake_raw_input_stream(**kwargs: object) -> MagicMock:
+        channels = kwargs["channels"]
+        if succeed_on is not None and channels == succeed_on:
+            return MagicMock()
+        raise _FakePortAudioError(f"Invalid number of channels [PaErrorCode {fail_code}]", fail_code)
+
+    mock_sd.RawInputStream = fake_raw_input_stream
+    return mock_sd
+
+
+def test_open_loopback_stream_succeeds_first_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_sd = _make_sd_mock(succeed_on=2)
+    monkeypatch.setitem(sys.modules, "sounddevice", mock_sd)
+
+    stream, opened = _open_loopback_stream(
+        device_id=1,
+        device_name="Speakers",
+        sample_rate_hz=16000,
+        native_channels=2,
+        blocksize=1600,
+        extra_settings=None,
+    )
+    assert opened == 2
+
+
+def test_open_loopback_stream_falls_back_to_stereo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """native_channels=4 fails, fallback 2 succeeds."""
+    mock_sd = _make_sd_mock(succeed_on=2)
+    monkeypatch.setitem(sys.modules, "sounddevice", mock_sd)
+
+    _, opened = _open_loopback_stream(
+        device_id=1,
+        device_name="Speakers",
+        sample_rate_hz=16000,
+        native_channels=4,
+        blocksize=1600,
+        extra_settings=None,
+    )
+    assert opened == 2
+
+
+def test_open_loopback_stream_falls_back_to_mono(monkeypatch: pytest.MonkeyPatch) -> None:
+    """native=2 fails, 2 is already tried, fallback 1 succeeds."""
+    mock_sd = _make_sd_mock(succeed_on=1)
+    monkeypatch.setitem(sys.modules, "sounddevice", mock_sd)
+
+    _, opened = _open_loopback_stream(
+        device_id=1,
+        device_name="Speakers",
+        sample_rate_hz=16000,
+        native_channels=2,
+        blocksize=1600,
+        extra_settings=None,
+    )
+    assert opened == 1
+
+
+def test_open_loopback_stream_no_duplicates_when_native_is_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """native=1 means candidates=[1, 2]; if 1 fails, 2 is tried."""
+    mock_sd = _make_sd_mock(succeed_on=2)
+    monkeypatch.setitem(sys.modules, "sounddevice", mock_sd)
+
+    _, opened = _open_loopback_stream(
+        device_id=1,
+        device_name="Speakers",
+        sample_rate_hz=16000,
+        native_channels=1,
+        blocksize=1600,
+        extra_settings=None,
+    )
+    assert opened == 2
+
+
+def test_open_loopback_stream_all_fail_raises_capture_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_sd = _make_sd_mock(succeed_on=None)
+    monkeypatch.setitem(sys.modules, "sounddevice", mock_sd)
+
+    with pytest.raises(CaptureError, match="Could not open system capture"):
+        _open_loopback_stream(
+            device_id=1,
+            device_name="Speakers (Realtek)",
+            sample_rate_hz=16000,
+            native_channels=2,
+            blocksize=1600,
+            extra_settings=None,
+        )
+
+
+def test_open_loopback_stream_bt_device_raises_helpful_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_sd = _make_sd_mock(succeed_on=None)
+    monkeypatch.setitem(sys.modules, "sounddevice", mock_sd)
+
+    bt_name = "Output 1 (@System32\\drivers\\bthhfenum.sys)"
+    with pytest.raises(CaptureError, match="Bluetooth HFP"):
+        _open_loopback_stream(
+            device_id=1,
+            device_name=bt_name,
+            sample_rate_hz=16000,
+            native_channels=2,
+            blocksize=1600,
+            extra_settings=None,
+        )
+
+
+def test_open_loopback_stream_non_channel_pa_error_surfaces_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PortAudioError that is NOT about invalid channels should not trigger retry."""
+    mock_sd = MagicMock()
+    mock_sd.PortAudioError = _FakePortAudioError
+
+    call_count: list[int] = [0]
+
+    def fail_with_other_code(**kwargs: object) -> MagicMock:
+        call_count[0] += 1
+        raise _FakePortAudioError("Device unavailable [PaErrorCode -9985]", -9985)
+
+    mock_sd.RawInputStream = fail_with_other_code
+    monkeypatch.setitem(sys.modules, "sounddevice", mock_sd)
+
+    with pytest.raises(CaptureError):
+        _open_loopback_stream(
+            device_id=1,
+            device_name="Speakers",
+            sample_rate_hz=16000,
+            native_channels=2,
+            blocksize=1600,
+            extra_settings=None,
+        )
+    # Must not retry on non-channel errors.
+    assert call_count[0] == 1
+
+
+def test_open_loopback_stream_sounddevice_missing_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "sounddevice", None)  # type: ignore[arg-type]
+    with pytest.raises(CaptureError, match="sounddevice is required"):
+        _open_loopback_stream(
+            device_id=1,
+            device_name="Speakers",
+            sample_rate_hz=16000,
+            native_channels=2,
+            blocksize=1600,
+            extra_settings=None,
+        )

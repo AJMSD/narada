@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import platform
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any, NoReturn, Protocol, cast
 
 from narada.audio.backends import linux, macos, windows
 from narada.devices import AudioDevice, DeviceResolutionError
@@ -149,6 +149,85 @@ def _query_native_channels(device_id: int, *, loopback: bool = False) -> int:
         return 2 if loopback else 1
 
 
+# PortAudio error code for an unsupported channel count.
+_PA_INVALID_CHANNELS = -9998
+
+# Substrings present in the raw device name when Windows routes audio through
+# the Bluetooth Hands-Free Profile driver.  These devices do not expose a
+# regular PCM loopback endpoint and will fail regardless of channel count.
+_BT_HFP_DRIVER_HINTS = ("bthhfenum",)
+
+
+def _raise_loopback_error(device_name: str, cause: Exception) -> NoReturn:
+    """Raise a descriptive CaptureError, detecting known unsupported device types."""
+    if any(hint in device_name.lower() for hint in _BT_HFP_DRIVER_HINTS):
+        raise CaptureError(
+            f"Device '{device_name}' uses the Bluetooth HFP driver and does not "
+            "support WASAPI loopback capture. Use a Realtek or USB audio output "
+            "device, or select 'Stereo Mix' if available."
+        ) from cause
+    raise CaptureError(
+        f"Could not open system capture stream for '{device_name}'. "
+        "The device may not support WASAPI loopback. "
+        "Try a different output device or 'Stereo Mix'."
+    ) from cause
+
+
+def _open_loopback_stream(
+    *,
+    device_id: int,
+    device_name: str,
+    sample_rate_hz: int,
+    native_channels: int,
+    blocksize: int,
+    extra_settings: Any | None,
+) -> tuple[StreamProtocol, int]:
+    """Open a loopback input stream, retrying with fallback channel counts.
+
+    WASAPI reports the *maximum* channel count for a device, but the shared-mode
+    mix format may differ.  This function tries ``native_channels`` first, then
+    falls back through ``[2, 1]`` (without repeating values already tried) when
+    PortAudio rejects the count with ``paInvalidNumChannels`` (-9998).  Any
+    other PortAudio error is surfaced immediately.
+
+    Returns ``(stream, channels_actually_opened)``.
+    """
+    try:
+        from sounddevice import PortAudioError
+    except ImportError as exc:
+        raise CaptureError("sounddevice is required for live audio capture.") from exc
+
+    # Ordered candidates: detected value first, common fallbacks after (no dupes).
+    seen: set[int] = set()
+    candidates: list[int] = []
+    for ch in (native_channels, 2, 1):
+        if ch >= 1 and ch not in seen:
+            seen.add(ch)
+            candidates.append(ch)
+
+    last_exc: PortAudioError | None = None
+    for channels in candidates:
+        try:
+            stream = _open_raw_input_stream(
+                device_id=device_id,
+                sample_rate_hz=sample_rate_hz,
+                channels=channels,
+                blocksize=blocksize,
+                extra_settings=extra_settings,
+            )
+            return stream, channels
+        except PortAudioError as exc:
+            if _PA_INVALID_CHANNELS in exc.args or "Invalid number of channels" in str(exc):
+                last_exc = exc
+                continue
+            # Non-channel PortAudio error — surface it immediately.
+            _raise_loopback_error(device_name, exc)
+        # CaptureError (e.g. sounddevice not installed) propagates unchanged.
+
+    assert last_exc is not None  # candidates is never empty
+    _raise_loopback_error(device_name, last_exc)
+
+
 def pcm16le_to_float32(pcm_bytes: bytes) -> tuple[float, ...]:
     if len(pcm_bytes) % 2 != 0:
         raise ValueError("PCM16 input must have an even byte-length.")
@@ -240,10 +319,11 @@ def open_system_capture(
         os_name=os_name or platform.system().lower(),
     )
     native_channels = _query_native_channels(resolved_device.id, loopback=True)
-    stream = _open_raw_input_stream(
+    stream, opened_channels = _open_loopback_stream(
         device_id=resolved_device.id,
+        device_name=resolved_device.name,
         sample_rate_hz=sample_rate_hz,
-        channels=native_channels,
+        native_channels=native_channels,
         blocksize=blocksize,
         extra_settings=extra_settings,
     )
@@ -253,5 +333,5 @@ def open_system_capture(
         channels=1,
         blocksize=blocksize,
         device_name=resolved_device.name,
-        native_channels=native_channels,
+        native_channels=opened_channels,
     )
