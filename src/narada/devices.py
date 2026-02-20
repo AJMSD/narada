@@ -145,7 +145,7 @@ def _device_sort_key(device: AudioDevice) -> tuple[int, int]:
     return (device.id, _DISPLAY_TYPE_ORDER[device.type])
 
 
-def _query_hostapi_names(sd: Any) -> dict[int, str]:
+def _query_hostapi_names_sounddevice(sd: Any) -> dict[int, str]:
     try:
         raw_hostapis = sd.query_hostapis()
     except Exception:
@@ -165,7 +165,7 @@ def _query_hostapi_names(sd: Any) -> dict[int, str]:
     return names
 
 
-def _default_device_indices(sd: Any) -> tuple[int, int]:
+def _default_device_indices_sounddevice(sd: Any) -> tuple[int, int]:
     try:
         raw_default = tuple(sd.default.device)
     except Exception:
@@ -177,15 +177,15 @@ def _default_device_indices(sd: Any) -> tuple[int, int]:
     return (input_idx, output_idx)
 
 
-def _enumerate_raw_devices() -> list[AudioDevice]:
+def _enumerate_raw_devices_sounddevice() -> list[AudioDevice]:
     try:
         import sounddevice as sd
     except ImportError:
         return []
 
     raw_devices = sd.query_devices()
-    default_input_idx, default_output_idx = _default_device_indices(sd)
-    hostapi_names = _query_hostapi_names(sd)
+    default_input_idx, default_output_idx = _default_device_indices_sounddevice(sd)
+    hostapi_names = _query_hostapi_names_sounddevice(sd)
     devices: list[AudioDevice] = []
 
     for idx, raw in enumerate(raw_devices):
@@ -222,6 +222,116 @@ def _enumerate_raw_devices() -> list[AudioDevice]:
 
     devices.sort(key=_device_sort_key)
     return devices
+
+
+def _query_hostapi_names_windows_pyaudio(audio: Any) -> dict[int, str]:
+    hostapi_names: dict[int, str] = {}
+    try:
+        hostapi_count = int(audio.get_host_api_count())
+    except Exception:
+        return {}
+
+    for idx in range(hostapi_count):
+        try:
+            info = audio.get_host_api_info_by_index(idx)
+        except Exception:
+            continue
+        raw_name = str(info.get("name", f"Host API {idx}"))
+        hostapi_names[idx] = _compact_whitespace(raw_name)
+    return hostapi_names
+
+
+def _default_device_indices_windows_pyaudio(audio: Any) -> tuple[int, int]:
+    default_input_idx = -1
+    default_output_idx = -1
+
+    try:
+        default_input_info = audio.get_default_input_device_info()
+    except Exception:
+        default_input_info = None
+    if isinstance(default_input_info, dict):
+        raw_index = default_input_info.get("index")
+        if raw_index is not None:
+            default_input_idx = int(raw_index)
+
+    try:
+        default_output_info = audio.get_default_output_device_info()
+    except Exception:
+        default_output_info = None
+    if isinstance(default_output_info, dict):
+        raw_index = default_output_info.get("index")
+        if raw_index is not None:
+            default_output_idx = int(raw_index)
+
+    return (default_input_idx, default_output_idx)
+
+
+def _enumerate_raw_devices_windows_pyaudio() -> list[AudioDevice]:
+    try:
+        import pyaudiowpatch as pyaudio
+    except ImportError:
+        return []
+    try:
+        audio = pyaudio.PyAudio()
+    except Exception:
+        return []
+
+    try:
+        default_input_idx, default_output_idx = _default_device_indices_windows_pyaudio(audio)
+        hostapi_names = _query_hostapi_names_windows_pyaudio(audio)
+        devices: list[AudioDevice] = []
+
+        for raw in audio.get_device_info_generator():
+            if bool(raw.get("isLoopbackDevice", False)):
+                continue
+            idx = int(raw.get("index", -1))
+            if idx < 0:
+                continue
+
+            name = _sanitize_device_name(str(raw.get("name", f"Device {idx}")), idx)
+            input_channels = int(raw.get("maxInputChannels", 0))
+            output_channels = int(raw.get("maxOutputChannels", 0))
+            hostapi_index = int(raw.get("hostApi", -1))
+            hostapi_name = hostapi_names.get(hostapi_index)
+
+            if input_channels > 0:
+                devices.append(
+                    AudioDevice(
+                        id=idx,
+                        name=name,
+                        type="input",
+                        is_default=idx == default_input_idx,
+                        hostapi=hostapi_name,
+                        input_device_id=idx,
+                    )
+                )
+            if output_channels > 0:
+                endpoint_type = _output_device_type(name)
+                devices.append(
+                    AudioDevice(
+                        id=idx,
+                        name=name,
+                        type=endpoint_type,
+                        is_default=idx == default_output_idx,
+                        hostapi=hostapi_name,
+                        system_device_id=idx,
+                        system_device_type=endpoint_type,
+                    )
+                )
+
+        devices.sort(key=_device_sort_key)
+        return devices
+    finally:
+        try:
+            audio.terminate()
+        except Exception:
+            pass
+
+
+def _enumerate_raw_devices() -> list[AudioDevice]:
+    if platform.system().strip().lower() == "windows":
+        return _enumerate_raw_devices_windows_pyaudio()
+    return _enumerate_raw_devices_sounddevice()
 
 
 def _dedupe_endpoints(

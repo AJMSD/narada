@@ -16,6 +16,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - Device selection by ID or name with fuzzy matching support.
 - Automatic OS-aware device deduplication in `narada devices` (use `--all` for raw endpoints).
 - On Windows, default `narada devices` output excludes legacy MME and DirectSound endpoints before deduplication; use `--all` to inspect raw host-API entries.
+- On Windows, live `mic` and `system` capture both use the same backend (`PyAudioWPatch`) so listed device IDs match capture runtime behavior.
 - Shared logical IDs for combo devices; Narada auto-selects input/output endpoint by command context.
 - `--language auto` default with multilingual input support through comma-separated values.
 - Software mixed mode target (mic + system in Narada).
@@ -56,9 +57,9 @@ One-time setup behavior:
 - Once model files are present locally, runs are offline unless you choose to fetch/update models.
 
 ## Limitations
-- System-audio capture depends on OS and backend support. On Windows, WASAPI loopback devices report their channel count at runtime; Narada queries this automatically and downmixes to mono before transcription. If the reported count is rejected, a fallback through common values is attempted.
-- Windows system mode requires a sounddevice/PortAudio build that exposes `WasapiSettings(loopback=True)`. If unavailable, Narada exits with a clear compatibility message.
-- Bluetooth HFP devices (Hands-Free Profile) do not expose a standard PCM loopback endpoint on Windows and will produce a descriptive error. Use a Realtek/USB output device or the built-in **Stereo Mix** input (`narada devices --type input`) for reliable system-audio capture.
+- System-audio capture depends on OS and backend support. On Windows, Narada uses `PyAudioWPatch` and WASAPI loopback sources; channel count is detected at runtime and downmixed to mono before transcription, with fallback through common values when needed.
+- Windows live capture (`--mode mic`, `--mode system`, `--mode mixed`) requires `PyAudioWPatch`.
+- Bluetooth HFP devices (Hands-Free Profile) do not expose a standard PCM loopback endpoint on Windows and will produce a descriptive error. If your driver exposes **Stereo Mix**, use it as an input path (`narada start --mode mic --mic <stereo-mix-id>`).
 - macOS system capture usually requires a virtual loopback device (for example BlackHole).
 - ASR runtime availability depends on optional dependencies being installed.
 - Current scaffold focuses on stable interfaces, validation, and quality gates while real-time capture integrations are expanded.
@@ -134,6 +135,13 @@ Run checks:
 ```bash
 narada doctor --file ./transcripts/session.txt
 ```
+
+Windows loopback smoke test:
+```bash
+narada devices
+narada start --mode system --system <output-id> --out ./transcripts/system.txt
+```
+Play audio while running and confirm transcript updates are non-silent.
 
 Structured stdin for `start` (useful for tests or automation):
 - Plain text line: treated as transcript text.

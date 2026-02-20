@@ -13,10 +13,11 @@ from narada.audio.capture import (
     _open_loopback_stream,
     _query_native_channels,
     _raise_loopback_error,
+    open_mic_capture,
     open_system_capture,
     pcm16le_to_float32,
 )
-from narada.devices import AudioDevice
+from narada.devices import AudioDevice, DeviceResolutionError
 
 
 def _pack_s16le(*values: int) -> bytes:
@@ -247,43 +248,31 @@ def test_query_native_channels_query_exception_returns_fallback() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_open_system_capture_opens_stream_with_native_channel_count(
+def test_open_system_capture_windows_uses_windows_backend_helper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    device = AudioDevice(id=5, name="Speakers", type="output")
-    mock_stream = _FakeStream()
-    opened_with: dict[str, int] = {}
+    selected = AudioDevice(id=5, name="Speakers", type="output", hostapi="Windows WASAPI")
+    resolved = AudioDevice(id=5, name="Speakers", type="output", hostapi="Windows WASAPI")
+    fake_stream = _FakeStream(frames=[(_pack_s16le(500, 1500), False)])
 
-    def fake_resolve(
-        selected_device: AudioDevice,
-        all_devices: list[AudioDevice],
-        os_name: str,
-    ) -> tuple[AudioDevice, object]:
-        return device, object()
+    monkeypatch.setattr(
+        "narada.audio.capture.windows.resolve_system_capture_device",
+        lambda *_args, **_kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        "narada.audio.capture.windows.open_windows_system_stream",
+        lambda **_kwargs: (fake_stream, 48000, 2, "Speakers [Loopback]"),
+    )
 
-    def fake_query(device_id: int, *, loopback: bool = False) -> int:
-        return 2
+    handle = open_system_capture(device=selected, all_devices=[selected], os_name="windows")
+    frame = handle.read_frame()
 
-    def fake_open_raw(
-        *,
-        device_id: int,
-        sample_rate_hz: int,
-        channels: int,
-        blocksize: int,
-        extra_settings: object = None,
-    ) -> _FakeStream:
-        opened_with["channels"] = channels
-        return mock_stream
-
-    monkeypatch.setattr("narada.audio.capture._resolve_system_backend_device", fake_resolve)
-    monkeypatch.setattr("narada.audio.capture._query_native_channels", fake_query)
-    monkeypatch.setattr("narada.audio.capture._open_raw_input_stream", fake_open_raw)
-
-    handle = open_system_capture(device=device, all_devices=[device], os_name="windows")
-
-    assert opened_with["channels"] == 2  # stream opened with hardware channel count
-    assert handle.channels == 1  # callers always see mono
+    assert handle.sample_rate_hz == 48000
+    assert handle.channels == 1
     assert handle._native_channels == 2
+    assert handle.device_name == "Speakers [Loopback]"
+    assert frame is not None
+    assert struct.unpack("<h", frame.pcm_bytes) == (1000,)
 
 
 def test_open_system_capture_mono_device_no_downmix_overhead(
@@ -300,34 +289,57 @@ def test_open_system_capture_mono_device_no_downmix_overhead(
         "narada.audio.capture._query_native_channels",
         lambda *a, **kw: 1,
     )
-    monkeypatch.setattr(
-        "narada.audio.capture._open_raw_input_stream",
-        lambda **kw: mock_stream,
-    )
+    opened_with: dict[str, int] = {}
+
+    def fake_open_loopback(**kwargs: int) -> tuple[_FakeStream, int]:
+        opened_with["device_id"] = kwargs["device_id"]
+        opened_with["native_channels"] = kwargs["native_channels"]
+        return mock_stream, kwargs["native_channels"]
+
+    monkeypatch.setattr("narada.audio.capture._open_loopback_stream", fake_open_loopback)
 
     handle = open_system_capture(device=device, all_devices=[device], os_name="linux")
+    assert opened_with["device_id"] == 3
+    assert opened_with["native_channels"] == 1
     assert handle._native_channels == 1
     frame = handle.read_frame()
     assert frame is not None
     assert frame.pcm_bytes == _pack_s16le(999)
 
 
-def test_open_system_capture_windows_requires_loopback_settings(
+def test_open_system_capture_windows_wraps_device_resolution_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    device = AudioDevice(id=5, name="Speakers", type="output")
-
+    selected = AudioDevice(id=5, name="Speakers", type="output", hostapi="MME")
     monkeypatch.setattr(
-        "narada.audio.capture._resolve_system_backend_device",
-        lambda *a, **kw: (device, None),
+        "narada.audio.capture.windows.resolve_system_capture_device",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            DeviceResolutionError("requires a WASAPI output device")
+        ),
     )
-    monkeypatch.setattr(
-        "narada.audio.capture.windows.loopback_support_error",
-        lambda: "Installed sounddevice does not support WASAPI loopback.",
-    )
+    with pytest.raises(CaptureError, match="requires a WASAPI output device"):
+        open_system_capture(device=selected, all_devices=[selected], os_name="windows")
 
-    with pytest.raises(CaptureError, match="does not support WASAPI loopback"):
-        open_system_capture(device=device, all_devices=[device], os_name="windows")
+
+def test_open_mic_capture_windows_uses_windows_backend_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = AudioDevice(id=7, name="USB Mic", type="input")
+    fake_stream = _FakeStream(frames=[(_pack_s16le(200, 400), False)])
+    monkeypatch.setattr(
+        "narada.audio.capture.windows.open_windows_mic_stream",
+        lambda **_kwargs: (fake_stream, 48000, 2),
+    )
+    monkeypatch.setattr("narada.audio.capture.platform.system", lambda: "Windows")
+
+    handle = open_mic_capture(device=device)
+    frame = handle.read_frame()
+
+    assert handle.sample_rate_hz == 48000
+    assert handle.channels == 1
+    assert handle._native_channels == 2
+    assert frame is not None
+    assert struct.unpack("<h", frame.pcm_bytes) == (300,)
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,8 @@ asr = [
   "whispercpp>=0.0.18",
 ]
 audio = [
-  "sounddevice>=0.4.7",
+  "sounddevice>=0.4.7; platform_system != 'Windows'",
+  "PyAudioWPatch>=0.2.12.8; platform_system == 'Windows'",
 ]
 noise = [
   "webrtcvad-wheels>=2.0.14",

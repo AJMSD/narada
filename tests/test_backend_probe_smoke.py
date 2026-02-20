@@ -5,6 +5,7 @@ from narada.devices import AudioDevice
 def test_windows_probe_smoke_reports_mic_and_system_support(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr("narada.audio.backends.windows._dependency_error", lambda: None)
     monkeypatch.setattr("narada.audio.backends.windows.loopback_support_error", lambda: None)
     devices = [
         AudioDevice(id=1, name="Mic", type="input"),

@@ -272,6 +272,22 @@ def open_mic_capture(
 ) -> CaptureHandle:
     if device.type != "input":
         raise DeviceResolutionError(f"Selected microphone device is not an input: {device.name}")
+    if platform.system().strip().lower() == "windows":
+        stream, opened_sample_rate_hz, opened_channels = windows.open_windows_mic_stream(
+            device_id=device.id,
+            device_name=device.name,
+            sample_rate_hz=sample_rate_hz,
+            channels=channels,
+            blocksize=blocksize,
+        )
+        return CaptureHandle(
+            stream=stream,
+            sample_rate_hz=opened_sample_rate_hz,
+            channels=1,
+            blocksize=blocksize,
+            device_name=device.name,
+            native_channels=opened_channels,
+        )
     stream = _open_raw_input_stream(
         device_id=device.id,
         sample_rate_hz=sample_rate_hz,
@@ -293,9 +309,6 @@ def _resolve_system_backend_device(
     os_name: str,
 ) -> tuple[AudioDevice, Any | None]:
     normalized_os = os_name.lower()
-    if normalized_os == "windows":
-        resolved = windows.resolve_system_capture_device(selected_device, all_devices)
-        return resolved, windows.build_loopback_settings()
     if normalized_os == "linux":
         resolved = linux.resolve_system_capture_device(selected_device, all_devices)
         return resolved, None
@@ -314,6 +327,28 @@ def open_system_capture(
     os_name: str | None = None,
 ) -> CaptureHandle:
     normalized_os = (os_name or platform.system().lower()).strip().lower()
+    if normalized_os == "windows":
+        try:
+            resolved_device = windows.resolve_system_capture_device(device, all_devices)
+            stream, opened_sample_rate_hz, opened_channels, resolved_name = (
+                windows.open_windows_system_stream(
+                    output_device_id=resolved_device.id,
+                    output_device_name=resolved_device.name,
+                    sample_rate_hz=sample_rate_hz,
+                    blocksize=blocksize,
+                )
+            )
+        except DeviceResolutionError as exc:
+            raise CaptureError(str(exc)) from exc
+        return CaptureHandle(
+            stream=stream,
+            sample_rate_hz=opened_sample_rate_hz,
+            channels=1,
+            blocksize=blocksize,
+            device_name=resolved_name,
+            native_channels=opened_channels,
+        )
+
     try:
         resolved_device, extra_settings = _resolve_system_backend_device(
             selected_device=device,
@@ -322,15 +357,6 @@ def open_system_capture(
         )
     except DeviceResolutionError as exc:
         raise CaptureError(str(exc)) from exc
-
-    if normalized_os == "windows" and extra_settings is None:
-        detail = windows.loopback_support_error()
-        if detail is None:
-            detail = (
-                "WASAPI loopback settings are unavailable for the selected Windows "
-                "device."
-            )
-        raise CaptureError(detail)
 
     native_channels = _query_native_channels(resolved_device.id, loopback=True)
     stream, opened_channels = _open_loopback_stream(

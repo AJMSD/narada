@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 import narada.devices as devices_module
@@ -113,7 +115,7 @@ def test_curate_wasapi_beats_mme_default_on_windows() -> None:
 
     This is the real-world regression: sounddevice reports the Windows system
     default as an MME device index.  The curated list must expose the WASAPI
-    ID so that WasapiSettings(loopback=True) is valid for system capture.
+    ID so that system capture always targets the WASAPI backend path.
     """
     raw = [
         AudioDevice(
@@ -347,6 +349,95 @@ def test_enumerate_devices_include_all_returns_raw(monkeypatch: pytest.MonkeyPat
     assert curated[0].type == "input/output"
     assert curated[0].system_device_id == 2
     assert [item.id for item in all_items] == [0, 1, 2]
+
+
+def test_enumerate_raw_devices_windows_pyaudio_excludes_loopback_and_sets_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakePyAudio:
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def get_host_api_count(self) -> int:
+            return 2
+
+        def get_host_api_info_by_index(self, index: int) -> dict[str, object]:
+            if index == 0:
+                return {"name": "Windows WASAPI"}
+            return {"name": "MME"}
+
+        def get_default_input_device_info(self) -> dict[str, object]:
+            return {"index": 10}
+
+        def get_default_output_device_info(self) -> dict[str, object]:
+            return {"index": 20}
+
+        def get_device_info_generator(self):  # type: ignore[no-untyped-def]
+            yield {
+                "index": 10,
+                "name": "Microphone (USB Device)",
+                "maxInputChannels": 1,
+                "maxOutputChannels": 0,
+                "hostApi": 0,
+            }
+            yield {
+                "index": 20,
+                "name": "Speakers (USB Device)",
+                "maxInputChannels": 0,
+                "maxOutputChannels": 2,
+                "hostApi": 0,
+            }
+            yield {
+                "index": 21,
+                "name": "Speakers (USB Device) [Loopback]",
+                "maxInputChannels": 2,
+                "maxOutputChannels": 0,
+                "hostApi": 0,
+                "isLoopbackDevice": True,
+            }
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    class _FakePyAudioModule:
+        def __init__(self) -> None:
+            self.instance = _FakePyAudio()
+
+        def PyAudio(self) -> _FakePyAudio:
+            return self.instance
+
+    fake_module = _FakePyAudioModule()
+    monkeypatch.setitem(sys.modules, "pyaudiowpatch", fake_module)
+
+    devices = devices_module._enumerate_raw_devices_windows_pyaudio()
+
+    assert [item.id for item in devices] == [10, 20]
+    assert devices[0].type == "input"
+    assert devices[0].is_default
+    assert devices[0].hostapi == "Windows WASAPI"
+    assert devices[1].type == "output"
+    assert devices[1].is_default
+    assert devices[1].hostapi == "Windows WASAPI"
+    assert fake_module.instance.terminated is True
+
+
+def test_enumerate_raw_devices_dispatches_to_windows_pyaudio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = [AudioDevice(id=22, name="Speakers", type="output")]
+    monkeypatch.setattr(devices_module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        devices_module,
+        "_enumerate_raw_devices_windows_pyaudio",
+        lambda: expected,
+    )
+    monkeypatch.setattr(
+        devices_module,
+        "_enumerate_raw_devices_sounddevice",
+        lambda: [_ for _ in ()].throw(AssertionError("sounddevice path should not run")),
+    )
+
+    assert devices_module._enumerate_raw_devices() == expected
 
 
 def test_filter_devices_includes_input_output_for_input_and_output_filters() -> None:
