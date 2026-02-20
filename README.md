@@ -20,6 +20,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - Software mixed mode target (mic + system in Narada).
 - Core PII redaction support (excluding names).
 - Append-only transcript writing with frequent flush and fsync.
+- Automatic hardware channel count detection for system capture; stereo WASAPI loopback devices are opened at their native channel count and downmixed to mono before ASR.
 - Optional LAN serving directly from `narada start --serve`.
 - LAN live view endpoints:
   - `/` browser page
@@ -54,7 +55,7 @@ One-time setup behavior:
 - Once model files are present locally, runs are offline unless you choose to fetch/update models.
 
 ## Limitations
-- System-audio capture depends on OS and backend support.
+- System-audio capture depends on OS and backend support. On Windows, WASAPI loopback devices report their channel count at runtime; Narada queries this automatically and downmixes to mono before transcription.
 - macOS system capture usually requires a virtual loopback device (for example BlackHole).
 - ASR runtime availability depends on optional dependencies being installed.
 - Current scaffold focuses on stable interfaces, validation, and quality gates while real-time capture integrations are expanded.
