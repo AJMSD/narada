@@ -7,6 +7,16 @@ from narada.asr.base import EngineUnavailableError, TranscriptionRequest
 from narada.asr.whisper_cpp_engine import WhisperCppEngine
 
 
+def test_whisper_cpp_is_available_requires_cli() -> None:
+    engine = WhisperCppEngine(which_fn=lambda _: None)
+    assert not engine.is_available()
+
+
+def test_whisper_cpp_is_available_with_cli() -> None:
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli")
+    assert engine.is_available()
+
+
 def test_whisper_cpp_transcribe_reads_cli_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

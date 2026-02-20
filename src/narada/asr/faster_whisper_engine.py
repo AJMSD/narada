@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import array
 import logging
 import math
 import os
@@ -10,6 +9,8 @@ from importlib.util import find_spec
 from pathlib import Path
 from threading import Lock
 from typing import Any, ClassVar
+
+import numpy as np
 
 from narada.asr.base import EngineUnavailableError, TranscriptionRequest, TranscriptSegment
 from narada.asr.model_discovery import resolve_faster_whisper_model_path
@@ -60,7 +61,7 @@ class FasterWhisperEngine:
         )
         self._warmup_model(model=model, cache_key=cache_key, request=request)
 
-        audio = self._pcm16le_to_float_list(request.pcm_bytes)
+        audio = self._pcm16le_to_float_array(request.pcm_bytes)
         language = self._choose_language(request.languages)
         multilingual = len([lang for lang in request.languages if lang != "auto"]) > 1
 
@@ -138,10 +139,9 @@ class FasterWhisperEngine:
         return None
 
     @staticmethod
-    def _pcm16le_to_float_list(pcm_bytes: bytes) -> list[float]:
-        samples = array.array("h")
-        samples.frombytes(pcm_bytes)
-        return [sample / 32768.0 for sample in samples]
+    def _pcm16le_to_float_array(pcm_bytes: bytes) -> np.ndarray[Any, np.dtype[np.float32]]:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        return (samples.astype(np.float32) / 32768.0).copy()
 
     @staticmethod
     def _confidence_from_segment(segment: Any) -> float:
@@ -208,7 +208,7 @@ class FasterWhisperEngine:
             if cache_key in self._warmed_models:
                 return
 
-        silence = [0.0] * min(max(request.sample_rate_hz // 2, 4000), 32000)
+        silence = np.zeros(min(max(request.sample_rate_hz // 2, 4000), 32000), dtype=np.float32)
         language = self._choose_language(request.languages)
         try:
             segments, _ = model.transcribe(

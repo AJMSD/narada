@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from narada.asr.base import EngineUnavailableError, TranscriptionRequest
@@ -21,10 +22,14 @@ class _FakeSegment:
 class _FakeModel:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.audio_inputs: list[np.ndarray] = []
 
     def transcribe(
-        self, _audio: object, **kwargs: object
+        self, audio: object, **kwargs: object
     ) -> tuple[list[_FakeSegment], dict[str, object]]:
+        assert isinstance(audio, np.ndarray)
+        assert audio.dtype == np.float32
+        self.audio_inputs.append(audio)
         self.calls.append(dict(kwargs))
         if kwargs.get("beam_size") == 1:
             return ([], {})
@@ -54,8 +59,19 @@ def test_faster_whisper_caches_and_warms_once() -> None:
     assert len(factory_calls) == 1
     warmup_calls = [call for call in fake_model.calls if call.get("beam_size") == 1]
     assert len(warmup_calls) == 1
+    assert len(fake_model.audio_inputs) == len(fake_model.calls)
+    assert all(audio.dtype == np.float32 for audio in fake_model.audio_inputs)
     assert first[0].text == "hello world"
     assert second[0].text == "hello world"
+
+
+def test_faster_whisper_pcm_conversion_returns_numpy_float32() -> None:
+    pcm = b"\x00\x00\xff\x7f\x00\x80"
+    audio = FasterWhisperEngine._pcm16le_to_float_array(pcm)  # noqa: SLF001
+
+    assert isinstance(audio, np.ndarray)
+    assert audio.dtype == np.float32
+    assert audio.shape == (3,)
 
 
 def test_faster_whisper_rejects_odd_pcm_length() -> None:

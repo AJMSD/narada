@@ -8,7 +8,6 @@ import tempfile
 import wave
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from importlib.util import find_spec
 from pathlib import Path
 from threading import Lock
 from typing import ClassVar
@@ -43,15 +42,13 @@ class WhisperCppEngine:
         self._model_directory = model_directory
 
     def is_available(self) -> bool:
-        has_python_binding = find_spec("whispercpp") is not None
-        has_cli_binary = self._which_fn("whisper-cli") is not None
-        return has_python_binding or has_cli_binary
+        return self._which_fn("whisper-cli") is not None
 
     def transcribe(self, request: TranscriptionRequest) -> Sequence[TranscriptSegment]:
         if not self.is_available():
             raise EngineUnavailableError(
-                "whisper.cpp runtime is not available. Install whispercpp "
-                "or provide whisper-cli binary."
+                "whisper.cpp runtime is not available. Install whisper.cpp and ensure "
+                "'whisper-cli' is available on PATH."
             )
         if request.sample_rate_hz <= 0:
             raise ValueError("sample_rate_hz must be positive.")

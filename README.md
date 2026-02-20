@@ -35,6 +35,8 @@ Narada supports two engine adapters from the start:
 - `faster-whisper`
 - `whisper-cpp`
 
+`whisper-cpp` runtime requires the `whisper-cli` binary available on your `PATH`.
+
 Select engine with:
 ```bash
 narada start --mode mic --mic 1 --engine faster-whisper
