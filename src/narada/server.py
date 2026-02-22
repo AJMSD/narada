@@ -42,7 +42,15 @@ INDEX_HTML = """<!doctype html>
   <script>
     const log = document.getElementById("log");
     const source = new EventSource("/events");
+    let lastRenderedEventId = -1;
     source.onmessage = (event) => {
+      const parsedEventId = Number.parseInt(event.lastEventId || "", 10);
+      if (Number.isFinite(parsedEventId)) {
+        if (parsedEventId <= lastRenderedEventId) {
+          return;
+        }
+        lastRenderedEventId = parsedEventId;
+      }
       log.textContent += event.data + "\\n";
       window.scrollTo(0, document.body.scrollHeight);
     };
@@ -112,25 +120,40 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
-        last_size = 0
+        cursor = self._parse_last_event_cursor(self.headers.get("Last-Event-ID"))
         while not self.server.stop_event.is_set():
             path = self.server.transcript_path
             try:
                 if path.exists():
                     content = path.read_text(encoding="utf-8")
                     current_size = len(content)
-                    if current_size < last_size:
-                        last_size = 0
-                    if current_size > last_size:
-                        delta = content[last_size:current_size]
-                        for line in delta.splitlines():
-                            event = f"data: {line}\n\n"
-                            self.wfile.write(event.encode("utf-8"))
+                    if current_size < cursor:
+                        cursor = 0
+                    sent_any = False
+                    while cursor < current_size:
+                        newline_index = content.find("\n", cursor)
+                        if newline_index == -1:
+                            break
+                        line = content[cursor:newline_index]
+                        cursor = newline_index + 1
+                        event = f"id: {cursor}\ndata: {line}\n\n"
+                        self.wfile.write(event.encode("utf-8"))
+                        sent_any = True
+                    if sent_any:
                         self.wfile.flush()
-                        last_size = current_size
                 time.sleep(0.5)
             except (BrokenPipeError, ConnectionResetError):
                 break
+
+    @staticmethod
+    def _parse_last_event_cursor(raw_value: str | None) -> int:
+        if raw_value is None:
+            return 0
+        try:
+            value = int(raw_value.strip())
+        except ValueError:
+            return 0
+        return max(0, value)
 
     def log_message(self, format: str, *args: object) -> None:
         return

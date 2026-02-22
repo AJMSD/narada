@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import threading
 from dataclasses import dataclass
 from typing import Any, NoReturn, Protocol, cast
 
@@ -33,6 +34,14 @@ class CapturedFrame:
     channels: int
 
 
+@dataclass(frozen=True)
+class CaptureStats:
+    frames_emitted: int = 0
+    dropped_frames: int = 0
+    overflow_frames: int = 0
+    bytes_emitted: int = 0
+
+
 class CaptureHandle:
     def __init__(
         self,
@@ -50,6 +59,11 @@ class CaptureHandle:
         self.device_name = device_name
         self._closed = False
         self._native_channels = native_channels if native_channels is not None else channels
+        self._stats_lock = threading.Lock()
+        self._frames_emitted = 0
+        self._dropped_frames = 0
+        self._overflow_frames = 0
+        self._bytes_emitted = 0
 
     def read_frame(self) -> CapturedFrame | None:
         if self._closed:
@@ -63,17 +77,33 @@ class CaptureHandle:
             ) from exc
 
         if overflowed:
+            with self._stats_lock:
+                self._overflow_frames += 1
+                self._dropped_frames += 1
             return None
         if not data:
             return None
         raw = bytes(data)
         if self._native_channels > 1:
             raw = _downmix_pcm16le_to_mono(raw, self._native_channels)
-        return CapturedFrame(
+        captured = CapturedFrame(
             pcm_bytes=raw,
             sample_rate_hz=self.sample_rate_hz,
             channels=self.channels,
         )
+        with self._stats_lock:
+            self._frames_emitted += 1
+            self._bytes_emitted += len(raw)
+        return captured
+
+    def stats_snapshot(self) -> CaptureStats:
+        with self._stats_lock:
+            return CaptureStats(
+                frames_emitted=self._frames_emitted,
+                dropped_frames=self._dropped_frames,
+                overflow_frames=self._overflow_frames,
+                bytes_emitted=self._bytes_emitted,
+            )
 
     def close(self) -> None:
         if self._closed:
@@ -116,9 +146,7 @@ def _downmix_pcm16le_to_mono(pcm_bytes: bytes, channels: int) -> bytes:
         total = 0
         for ch in range(channels):
             offset = frame_start + ch * 2
-            sample = int.from_bytes(
-                pcm_bytes[offset : offset + 2], byteorder="little", signed=True
-            )
+            sample = int.from_bytes(pcm_bytes[offset : offset + 2], byteorder="little", signed=True)
             total += sample
         mono_sample = total // channels
         out[out_idx : out_idx + 2] = mono_sample.to_bytes(2, byteorder="little", signed=True)

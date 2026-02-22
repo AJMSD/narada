@@ -8,6 +8,7 @@ from pathlib import Path
 
 from narada.asr.base import build_engine
 from narada.asr.model_discovery import discover_models
+from narada.asr.whisper_cpp_engine import WhisperCppEngine
 from narada.audio.backends import linux, macos, windows
 from narada.devices import AudioDevice, enumerate_devices
 
@@ -54,6 +55,36 @@ def _engine_checks() -> list[DoctorCheck]:
             DoctorCheck(name=f"ASR engine: {engine_name}", status=status, message=message)
         )
     return checks
+
+
+def _whisper_cli_compatibility_check() -> DoctorCheck:
+    engine = WhisperCppEngine()
+    if not engine.is_available():
+        return DoctorCheck(
+            name="whisper-cli compatibility",
+            status="INFO",
+            message="whisper-cli not found on PATH; compatibility checks skipped.",
+        )
+    try:
+        capabilities = engine.probe_cli_capabilities()
+    except Exception as exc:
+        return DoctorCheck(
+            name="whisper-cli compatibility",
+            status="WARN",
+            message=f"Could not probe whisper-cli capabilities: {exc}",
+        )
+
+    hint_text = ", ".join(capabilities.backend_hints) if capabilities.backend_hints else "unknown"
+    no_gpu_text = capabilities.no_gpu_flag or "missing"
+    gpu_layers_text = capabilities.gpu_layers_flag or "missing"
+    status = "PASS" if capabilities.no_gpu_flag is not None else "WARN"
+    message = (
+        f"cpu no-gpu flag: {no_gpu_text} | gpu-layers flag: {gpu_layers_text} | "
+        f"backend hints: {hint_text}"
+    )
+    if status == "WARN":
+        message += " | compute=cpu cannot be strictly enforced on this whisper-cli build."
+    return DoctorCheck(name="whisper-cli compatibility", status=status, message=message)
 
 
 def _model_checks(
@@ -173,7 +204,13 @@ def run_doctor(
     whisper_cpp_model_dir: Path | None = None,
 ) -> list[DoctorCheck]:
     devices = enumerate_devices()
-    checks = [_python_check(), _device_check(devices), _audio_probe(devices), *_engine_checks()]
+    checks = [
+        _python_check(),
+        _device_check(devices),
+        _audio_probe(devices),
+        *_engine_checks(),
+        _whisper_cli_compatibility_check(),
+    ]
     checks.extend(
         _model_checks(
             model_name,

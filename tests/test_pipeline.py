@@ -1,5 +1,5 @@
 from narada.asr.base import TranscriptSegment
-from narada.pipeline import ConfidenceGate, OverlapChunker
+from narada.pipeline import ConfidenceGate, OverlapChunker, StabilizedConfidenceGate
 
 
 def test_confidence_gate_commits_confident_segments() -> None:
@@ -46,3 +46,58 @@ def test_overlap_chunker_on_format_change_flushes_existing_buffer() -> None:
     emitted = chunker.ingest(b"\x01\x00" * 4, sample_rate_hz=8, channels=1)
     assert len(emitted) == 1
     assert emitted[0].sample_rate_hz == 4
+
+
+def test_stabilized_gate_holds_back_one_window_before_commit() -> None:
+    gate = StabilizedConfidenceGate(threshold=0.65, holdback_windows=1)
+    first = gate.ingest(
+        [TranscriptSegment(text="first", confidence=0.9, start_s=0.0, end_s=1.0, is_final=False)]
+    )
+    second = gate.ingest(
+        [TranscriptSegment(text="second", confidence=0.9, start_s=1.0, end_s=2.0, is_final=False)]
+    )
+
+    assert first == []
+    assert [item.text for item in second] == ["first"]
+    assert [item.text for item in gate.drain_pending()] == ["second"]
+
+
+def test_stabilized_gate_dedupes_overlap_text() -> None:
+    gate = StabilizedConfidenceGate(threshold=0.65, holdback_windows=0)
+    first = gate.ingest(
+        [TranscriptSegment(text="same line", confidence=0.9, start_s=0.0, end_s=1.0, is_final=True)]
+    )
+    second = gate.ingest(
+        [
+            TranscriptSegment(
+                text="same   line",
+                confidence=0.95,
+                start_s=1.0,
+                end_s=2.0,
+                is_final=True,
+            )
+        ]
+    )
+
+    assert [item.text for item in first] == ["same line"]
+    assert second == []
+
+
+def test_stabilized_gate_force_drains_low_confidence_on_finalize() -> None:
+    gate = StabilizedConfidenceGate(threshold=0.95, holdback_windows=0)
+    first = gate.ingest(
+        [
+            TranscriptSegment(
+                text="uncertain",
+                confidence=0.4,
+                start_s=0.0,
+                end_s=1.0,
+                is_final=False,
+            )
+        ]
+    )
+
+    assert first == []
+    assert gate.drain_pending(force_low_conf=False) == []
+    forced = gate.drain_pending(force_low_conf=True)
+    assert [item.text for item in forced] == ["uncertain"]

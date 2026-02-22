@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -142,4 +144,88 @@ class ConfidenceGate:
             if item.text.strip()
         ]
         self._pending.clear()
+        return committed
+
+
+class StabilizedConfidenceGate:
+    def __init__(
+        self,
+        threshold: float,
+        holdback_windows: int = 1,
+        recent_window_size: int = 256,
+    ) -> None:
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between 0 and 1.")
+        if holdback_windows < 0:
+            raise ValueError("holdback_windows must be non-negative.")
+        if recent_window_size <= 0:
+            raise ValueError("recent_window_size must be positive.")
+        self.threshold = threshold
+        self.holdback_windows = holdback_windows
+        self._window_holdback: deque[list[CommittedLine]] = deque()
+        self._pending_low_conf: list[TranscriptSegment] = []
+        self._recent_emitted: deque[str] = deque(maxlen=recent_window_size)
+
+    @staticmethod
+    def _normalize_for_dedupe(value: str) -> str:
+        return re.sub(r"\s+", " ", value.strip().lower())
+
+    def _dedupe(self, lines: Sequence[CommittedLine]) -> list[CommittedLine]:
+        committed: list[CommittedLine] = []
+        for line in lines:
+            normalized = self._normalize_for_dedupe(line.text)
+            if not normalized:
+                continue
+            if normalized in self._recent_emitted:
+                continue
+            self._recent_emitted.append(normalized)
+            committed.append(line)
+        return committed
+
+    def _emit_ready_windows(self) -> list[CommittedLine]:
+        committed: list[CommittedLine] = []
+        while len(self._window_holdback) > self.holdback_windows:
+            window_lines = self._window_holdback.popleft()
+            committed.extend(self._dedupe(window_lines))
+        return committed
+
+    def _emit_all_windows(self) -> list[CommittedLine]:
+        committed: list[CommittedLine] = []
+        while self._window_holdback:
+            committed.extend(self._dedupe(self._window_holdback.popleft()))
+        return committed
+
+    def ingest(
+        self,
+        segments: Sequence[TranscriptSegment],
+        *,
+        is_final_window: bool = False,
+    ) -> list[CommittedLine]:
+        current_window: list[CommittedLine] = []
+        for segment in segments:
+            cleaned = segment.text.strip()
+            if not cleaned:
+                continue
+            if segment.confidence >= self.threshold or segment.is_final:
+                current_window.append(CommittedLine(text=cleaned, confidence=segment.confidence))
+                continue
+            self._pending_low_conf.append(segment)
+        self._window_holdback.append(current_window)
+        if is_final_window:
+            return self._emit_all_windows()
+        return self._emit_ready_windows()
+
+    def drain_pending(self, *, force_low_conf: bool = False) -> list[CommittedLine]:
+        committed = self._emit_all_windows()
+        if force_low_conf:
+            committed.extend(
+                self._dedupe(
+                    [
+                        CommittedLine(text=item.text.strip(), confidence=item.confidence)
+                        for item in self._pending_low_conf
+                        if item.text.strip()
+                    ]
+                )
+            )
+            self._pending_low_conf.clear()
         return committed

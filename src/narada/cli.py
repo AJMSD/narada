@@ -45,9 +45,15 @@ from narada.devices import (
     resolve_device,
 )
 from narada.doctor import format_doctor_report, has_failures, run_doctor
+from narada.live_notes import AsrResult, AsrTask, IntervalPlanner, SessionSpool
 from narada.logging_setup import setup_logging
 from narada.performance import RuntimePerformance
-from narada.pipeline import AudioChunkWindow, ConfidenceGate, OverlapChunker
+from narada.pipeline import (
+    AudioChunkWindow,
+    ConfidenceGate,
+    OverlapChunker,
+    StabilizedConfidenceGate,
+)
 from narada.redaction import redact_text
 from narada.server import (
     RunningTranscriptServer,
@@ -61,6 +67,44 @@ from narada.writer import TranscriptWriter
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Narada local transcript CLI.")
 logger = logging.getLogger("narada.cli")
 _BACKLOG_WARNING_INTERVAL_S = 30.0
+_ASR_TASK_QUEUE_MAX = 2
+
+
+class _LiveStatusRenderer:
+    def __init__(self) -> None:
+        stream = sys.stdout
+        self._stream = stream if hasattr(stream, "write") else None
+        self._line_count = 0
+        self._supports_ansi = bool(
+            self._stream is not None
+            and hasattr(self._stream, "isatty")
+            and self._stream.isatty()
+        )
+
+    def render(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        normalized = [line.rstrip() for line in lines]
+        if not self._supports_ansi or self._stream is None:
+            for line in normalized:
+                _safe_echo(line)
+            return
+        try:
+            if self._line_count > 0:
+                self._stream.write(f"\x1b[{self._line_count}F")
+            max_lines = max(self._line_count, len(normalized))
+            for index in range(max_lines):
+                self._stream.write("\x1b[2K")
+                if index < len(normalized):
+                    self._stream.write(normalized[index])
+                self._stream.write("\n")
+            self._stream.flush()
+            self._line_count = len(normalized)
+        except Exception:
+            self._supports_ansi = False
+            self._line_count = 0
+            for line in normalized:
+                _safe_echo(line)
 
 
 @app.callback()
@@ -110,6 +154,45 @@ def _safe_echo(message: str, *, err: bool = False, nl: bool = True) -> None:
             fallback_stream.flush()
         except Exception:
             return
+
+
+def _estimate_shutdown_eta_seconds(
+    *,
+    asr_backlog_s: float,
+    performance: RuntimePerformance,
+) -> float:
+    backlog_s = max(0.0, asr_backlog_s)
+    realtime_factor = performance.realtime_factor
+    if realtime_factor is None or realtime_factor <= 0.0:
+        realtime_factor = 1.0
+    return backlog_s * realtime_factor
+
+
+def _build_live_status_lines(
+    *,
+    config: RuntimeConfig,
+    started_at: float,
+    performance: RuntimePerformance,
+    asr_backlog_warning_s: float | None = None,
+    shutdown_eta_s: float | None = None,
+    shutdown_reason: str | None = None,
+) -> list[str]:
+    lines = [
+        f"REC {_elapsed(started_at)} | mode={config.mode} | model={config.model}",
+        performance.status_fragment(),
+    ]
+    if asr_backlog_warning_s is not None:
+        lines.append(
+            f"Warning: ASR backlog is {asr_backlog_warning_s:.1f}s. "
+            "Notes may lag behind live audio."
+        )
+    if shutdown_eta_s is not None:
+        reason_text = f" ({shutdown_reason})" if shutdown_reason else ""
+        lines.append(
+            "Application stopping. ASR completing first. "
+            f"Will stop in about ~{shutdown_eta_s:.1f}s{reason_text}"
+        )
+    return lines
 
 
 def _transcribe_windows(
@@ -251,6 +334,612 @@ def _maybe_warn_capture_backlog(
     return now_monotonic
 
 
+def _estimate_asr_backlog_seconds(
+    *,
+    planner_backlog_s: float,
+    queued_tasks: int,
+    interval_s: float,
+) -> float:
+    if planner_backlog_s < 0:
+        planner_backlog_s = 0.0
+    if queued_tasks < 0:
+        queued_tasks = 0
+    if interval_s < 0:
+        interval_s = 0.0
+    return planner_backlog_s + (queued_tasks * interval_s)
+
+
+def _maybe_warn_asr_backlog(
+    *,
+    backlog_s: float,
+    warn_threshold_s: float,
+    now_monotonic: float,
+    last_warned_at: float | None,
+) -> float | None:
+    if backlog_s < warn_threshold_s:
+        return last_warned_at
+    if last_warned_at is not None and (
+        now_monotonic - last_warned_at < _BACKLOG_WARNING_INTERVAL_S
+    ):
+        return last_warned_at
+    message = f"Warning: ASR backlog is {backlog_s:.1f}s. Notes may lag behind live audio."
+    logger.warning(message)
+    return now_monotonic
+
+
+def _asr_worker_loop(
+    *,
+    task_queue: queue.Queue[AsrTask | None],
+    result_queue: queue.Queue[AsrResult],
+    spool: SessionSpool,
+    engine_instance: AsrEngine,
+    config: RuntimeConfig,
+) -> None:
+    while True:
+        try:
+            task = task_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if task is None:
+            return
+        started = time.perf_counter()
+        try:
+            pcm_bytes = spool.read_range(start_byte=task.start_byte, end_byte=task.end_byte)
+            request = TranscriptionRequest(
+                pcm_bytes=pcm_bytes,
+                sample_rate_hz=task.sample_rate_hz,
+                languages=config.languages,
+                model=config.model,
+                compute=config.compute,
+            )
+            segments = tuple(engine_instance.transcribe(request))
+            result_queue.put(
+                AsrResult(
+                    task=task,
+                    segments=segments,
+                    audio_seconds=task.audio_seconds,
+                    processing_seconds=time.perf_counter() - started,
+                    error=None,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - backend/runtime-specific errors
+            result_queue.put(
+                AsrResult(
+                    task=task,
+                    segments=tuple(),
+                    audio_seconds=task.audio_seconds,
+                    processing_seconds=time.perf_counter() - started,
+                    error=str(exc),
+                )
+            )
+
+
+def _enqueue_interval_task(
+    *,
+    task_queue: queue.Queue[AsrTask | None],
+    task: AsrTask,
+) -> bool:
+    try:
+        task_queue.put_nowait(task)
+    except queue.Full:
+        return False
+    return True
+
+
+def _drain_asr_results(
+    *,
+    result_queue: queue.Queue[AsrResult],
+    gate_state: StabilizedConfidenceGate,
+    writer: TranscriptWriter,
+    config: RuntimeConfig,
+    performance: RuntimePerformance,
+    started_at: float,
+) -> int:
+    drained = 0
+    while True:
+        try:
+            result = result_queue.get_nowait()
+        except queue.Empty:
+            break
+        drained += 1
+        if result.error is not None:
+            message = (
+                f"Warning: ASR task '{result.task.label}' failed "
+                f"for bytes [{result.task.start_byte}, {result.task.end_byte}): {result.error}"
+            )
+            logger.warning(message)
+            _safe_echo(message, err=True)
+            continue
+        performance.record_transcription(
+            audio_seconds=result.audio_seconds,
+            processing_seconds=result.processing_seconds,
+        )
+        committed = gate_state.ingest(result.segments, is_final_window=result.task.is_final)
+        _write_committed_lines(
+            committed=cast(list[object], committed),
+            writer=writer,
+            config=config,
+            performance=performance,
+            started_at=started_at,
+        )
+    return drained
+
+
+def _run_tty_notes_first(
+    *,
+    config: RuntimeConfig,
+    mic_device: AudioDevice | None,
+    system_device: AudioDevice | None,
+    all_devices: list[AudioDevice],
+    engine_instance: AsrEngine,
+    writer: TranscriptWriter,
+    performance: RuntimePerformance,
+    started_at: float,
+    mixed_resync_state: DriftResyncState,
+) -> bool:
+    stopped_by_user = False
+    shutdown_reason = "stop request"
+    mic_capture: CaptureHandle | None = None
+    system_capture: CaptureHandle | None = None
+    mic_queue: queue.Queue[CapturedFrame] | None = None
+    system_queue: queue.Queue[CapturedFrame] | None = None
+    capture_threads: list[threading.Thread] = []
+    capture_errors: queue.Queue[tuple[str, Exception]] = queue.Queue()
+    capture_stop = threading.Event()
+    asr_task_queue: queue.Queue[AsrTask | None] = queue.Queue(maxsize=_ASR_TASK_QUEUE_MAX)
+    asr_result_queue: queue.Queue[AsrResult] = queue.Queue()
+    asr_thread: threading.Thread | None = None
+    spool: SessionSpool | None = None
+    spool_keep_files = config.keep_spool
+    status_renderer = _LiveStatusRenderer()
+    live_gate_state = StabilizedConfidenceGate(
+        threshold=config.confidence_threshold,
+        holdback_windows=config.notes_commit_holdback_windows,
+    )
+    planner = IntervalPlanner(
+        interval_seconds=config.notes_interval_seconds,
+        overlap_seconds=config.notes_overlap_seconds,
+    )
+
+    def _drain_capture_queue_to_pending(
+        source_queue: queue.Queue[CapturedFrame] | None,
+        target_pending: deque[CapturedFrame],
+    ) -> None:
+        if source_queue is None:
+            return
+        while True:
+            try:
+                target_pending.append(source_queue.get_nowait())
+            except queue.Empty:
+                break
+
+    def _ingest_pcm_for_notes(
+        pcm_bytes: bytes,
+        sample_rate_hz: int,
+        channels: int,
+        *,
+        now_monotonic: float,
+    ) -> None:
+        if spool is None:
+            raise CaptureError("Live spool is unavailable.")
+        try:
+            record = spool.append_frame(
+                pcm_bytes=pcm_bytes,
+                sample_rate_hz=sample_rate_hz,
+                channels=channels,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise CaptureError(f"Failed to write live spool data: {exc}") from exc
+        planner.ingest_record(record, now_monotonic=now_monotonic)
+
+    def _render_live_status(*, asr_backlog_s: float, include_shutdown_notice: bool = False) -> None:
+        warning_backlog_s = (
+            asr_backlog_s if asr_backlog_s >= config.asr_backlog_warn_seconds else None
+        )
+        shutdown_eta_s = (
+            _estimate_shutdown_eta_seconds(asr_backlog_s=asr_backlog_s, performance=performance)
+            if include_shutdown_notice
+            else None
+        )
+        status_renderer.render(
+            _build_live_status_lines(
+                config=config,
+                started_at=started_at,
+                performance=performance,
+                asr_backlog_warning_s=warning_backlog_s,
+                shutdown_eta_s=shutdown_eta_s,
+                shutdown_reason=shutdown_reason if include_shutdown_notice else None,
+            )
+        )
+
+    try:
+        if config.mode in {"mic", "mixed"} and mic_device is not None:
+            mic_capture = open_mic_capture(device=mic_device)
+            mic_queue = queue.Queue()
+        if config.mode in {"system", "mixed"} and system_device is not None:
+            system_capture = open_system_capture(
+                device=system_device,
+                all_devices=all_devices,
+            )
+            system_queue = queue.Queue()
+
+        if mic_capture is not None and mic_queue is not None:
+            mic_thread = threading.Thread(
+                target=_capture_worker_loop,
+                kwargs={
+                    "source_name": "mic",
+                    "capture_handle": mic_capture,
+                    "frame_queue": mic_queue,
+                    "stop_event": capture_stop,
+                    "error_queue": capture_errors,
+                },
+                daemon=True,
+                name="narada-mic-capture",
+            )
+            mic_thread.start()
+            capture_threads.append(mic_thread)
+        if system_capture is not None and system_queue is not None:
+            system_thread = threading.Thread(
+                target=_capture_worker_loop,
+                kwargs={
+                    "source_name": "system",
+                    "capture_handle": system_capture,
+                    "frame_queue": system_queue,
+                    "stop_event": capture_stop,
+                    "error_queue": capture_errors,
+                },
+                daemon=True,
+                name="narada-system-capture",
+            )
+            system_thread.start()
+            capture_threads.append(system_thread)
+
+        spool = SessionSpool(base_dir=config.out.parent, prefix=f"narada-{config.out.stem}-spool")
+        asr_thread = threading.Thread(
+            target=_asr_worker_loop,
+            kwargs={
+                "task_queue": asr_task_queue,
+                "result_queue": asr_result_queue,
+                "spool": spool,
+                "engine_instance": engine_instance,
+                "config": config,
+            },
+            daemon=True,
+            name="narada-asr-worker",
+        )
+        asr_thread.start()
+
+        mic_pending: deque[CapturedFrame] = deque()
+        system_pending: deque[CapturedFrame] = deque()
+        next_status_at = time.monotonic()
+        last_capture_backlog_warning_at: dict[str, float | None] = {
+            "mic": None,
+            "system": None,
+        }
+        last_asr_backlog_warning_at: float | None = None
+
+        while True:
+            cycle_started_at = time.perf_counter()
+            processed_any = False
+            try:
+                source_name, worker_exc = capture_errors.get_nowait()
+            except queue.Empty:
+                source_name = ""
+                worker_exc = None
+            if worker_exc is not None:
+                if isinstance(worker_exc, (DeviceDisconnectedError, CaptureError)):
+                    raise worker_exc
+                raise CaptureError(f"{source_name} capture failed: {worker_exc}") from worker_exc
+
+            _drain_capture_queue_to_pending(mic_queue, mic_pending)
+            _drain_capture_queue_to_pending(system_queue, system_pending)
+            if mic_pending or system_pending:
+                processed_any = True
+
+            now_monotonic = time.monotonic()
+            if config.mode == "mic":
+                while mic_pending:
+                    mic_frame = mic_pending.popleft()
+                    _ingest_pcm_for_notes(
+                        mic_frame.pcm_bytes,
+                        mic_frame.sample_rate_hz,
+                        mic_frame.channels,
+                        now_monotonic=now_monotonic,
+                    )
+            elif config.mode == "system":
+                while system_pending:
+                    system_frame = system_pending.popleft()
+                    _ingest_pcm_for_notes(
+                        system_frame.pcm_bytes,
+                        system_frame.sample_rate_hz,
+                        system_frame.channels,
+                        now_monotonic=now_monotonic,
+                    )
+            elif config.mode == "mixed" and mic_capture is not None and system_capture is not None:
+                while mic_pending and system_pending:
+                    mic_frame = mic_pending.popleft()
+                    system_frame = system_pending.popleft()
+                    mixed_samples, mixed_rate = mix_audio_chunks(
+                        AudioChunk(
+                            samples=pcm16le_to_float32(mic_frame.pcm_bytes),
+                            sample_rate_hz=mic_frame.sample_rate_hz,
+                            channels=mic_frame.channels,
+                        ),
+                        AudioChunk(
+                            samples=pcm16le_to_float32(system_frame.pcm_bytes),
+                            sample_rate_hz=system_frame.sample_rate_hz,
+                            channels=system_frame.channels,
+                        ),
+                        resync_state=mixed_resync_state,
+                    )
+                    _ingest_pcm_for_notes(
+                        mono_frame_to_pcm16le(
+                            MonoAudioFrame(samples=tuple(mixed_samples), sample_rate_hz=mixed_rate)
+                        ),
+                        mixed_rate,
+                        1,
+                        now_monotonic=now_monotonic,
+                    )
+
+            while not asr_task_queue.full():
+                task = planner.pop_next_ready_task(now_monotonic=now_monotonic)
+                if task is None:
+                    break
+                if not _enqueue_interval_task(task_queue=asr_task_queue, task=task):
+                    break
+                processed_any = True
+
+            drained = _drain_asr_results(
+                result_queue=asr_result_queue,
+                gate_state=live_gate_state,
+                writer=writer,
+                config=config,
+                performance=performance,
+                started_at=cycle_started_at,
+            )
+            if drained > 0:
+                processed_any = True
+
+            capture_backlog_values: list[float] = []
+            if mic_capture is not None and mic_queue is not None:
+                mic_queued_frames = mic_queue.qsize() + len(mic_pending)
+                capture_backlog_values.append(
+                    _estimate_capture_backlog_seconds(
+                        queued_frames=mic_queued_frames,
+                        blocksize=mic_capture.blocksize,
+                        sample_rate_hz=mic_capture.sample_rate_hz,
+                    )
+                )
+                last_capture_backlog_warning_at["mic"] = _maybe_warn_capture_backlog(
+                    source_name="mic",
+                    queued_frames=mic_queued_frames,
+                    blocksize=mic_capture.blocksize,
+                    sample_rate_hz=mic_capture.sample_rate_hz,
+                    warn_threshold_s=config.capture_queue_warn_seconds,
+                    now_monotonic=now_monotonic,
+                    last_warned_at=last_capture_backlog_warning_at["mic"],
+                )
+            if system_capture is not None and system_queue is not None:
+                system_queued_frames = system_queue.qsize() + len(system_pending)
+                capture_backlog_values.append(
+                    _estimate_capture_backlog_seconds(
+                        queued_frames=system_queued_frames,
+                        blocksize=system_capture.blocksize,
+                        sample_rate_hz=system_capture.sample_rate_hz,
+                    )
+                )
+                last_capture_backlog_warning_at["system"] = _maybe_warn_capture_backlog(
+                    source_name="system",
+                    queued_frames=system_queued_frames,
+                    blocksize=system_capture.blocksize,
+                    sample_rate_hz=system_capture.sample_rate_hz,
+                    warn_threshold_s=config.capture_queue_warn_seconds,
+                    now_monotonic=now_monotonic,
+                    last_warned_at=last_capture_backlog_warning_at["system"],
+                )
+            capture_backlog_s = max(capture_backlog_values) if capture_backlog_values else 0.0
+            asr_backlog_s = _estimate_asr_backlog_seconds(
+                planner_backlog_s=planner.pending_backlog_seconds(),
+                queued_tasks=asr_task_queue.qsize(),
+                interval_s=config.notes_interval_seconds,
+            )
+            last_asr_backlog_warning_at = _maybe_warn_asr_backlog(
+                backlog_s=asr_backlog_s,
+                warn_threshold_s=config.asr_backlog_warn_seconds,
+                now_monotonic=now_monotonic,
+                last_warned_at=last_asr_backlog_warning_at,
+            )
+            performance.set_backlogs(
+                capture_backlog_s=capture_backlog_s,
+                asr_backlog_s=asr_backlog_s,
+            )
+            dropped_frames = 0
+            if mic_capture is not None:
+                dropped_frames += mic_capture.stats_snapshot().dropped_frames
+            if system_capture is not None:
+                dropped_frames += system_capture.stats_snapshot().dropped_frames
+            performance.set_dropped_frames(dropped_frames=dropped_frames)
+
+            if now_monotonic >= next_status_at:
+                _render_live_status(asr_backlog_s=asr_backlog_s)
+                next_status_at = now_monotonic + 1.0
+
+            if not processed_any:
+                time.sleep(0.01)
+    except KeyboardInterrupt:
+        stopped_by_user = True
+        shutdown_reason = "Ctrl+C"
+    except Exception:
+        shutdown_reason = "runtime error"
+        spool_keep_files = True
+        raise
+    finally:
+        finalization_started_at = time.perf_counter()
+        capture_stop.set()
+        for thread in capture_threads:
+            thread.join(timeout=1.0)
+
+        mic_pending_final: deque[CapturedFrame] = deque()
+        system_pending_final: deque[CapturedFrame] = deque()
+        _drain_capture_queue_to_pending(mic_queue, mic_pending_final)
+        _drain_capture_queue_to_pending(system_queue, system_pending_final)
+
+        now_monotonic = time.monotonic()
+        if config.mode == "mic":
+            while mic_pending_final:
+                mic_frame = mic_pending_final.popleft()
+                _ingest_pcm_for_notes(
+                    mic_frame.pcm_bytes,
+                    mic_frame.sample_rate_hz,
+                    mic_frame.channels,
+                    now_monotonic=now_monotonic,
+                )
+        elif config.mode == "system":
+            while system_pending_final:
+                system_frame = system_pending_final.popleft()
+                _ingest_pcm_for_notes(
+                    system_frame.pcm_bytes,
+                    system_frame.sample_rate_hz,
+                    system_frame.channels,
+                    now_monotonic=now_monotonic,
+                )
+        elif config.mode == "mixed" and mic_capture is not None and system_capture is not None:
+            while mic_pending_final and system_pending_final:
+                mic_frame = mic_pending_final.popleft()
+                system_frame = system_pending_final.popleft()
+                mixed_samples, mixed_rate = mix_audio_chunks(
+                    AudioChunk(
+                        samples=pcm16le_to_float32(mic_frame.pcm_bytes),
+                        sample_rate_hz=mic_frame.sample_rate_hz,
+                        channels=mic_frame.channels,
+                    ),
+                    AudioChunk(
+                        samples=pcm16le_to_float32(system_frame.pcm_bytes),
+                        sample_rate_hz=system_frame.sample_rate_hz,
+                        channels=system_frame.channels,
+                    ),
+                    resync_state=mixed_resync_state,
+                )
+                _ingest_pcm_for_notes(
+                    mono_frame_to_pcm16le(
+                        MonoAudioFrame(samples=tuple(mixed_samples), sample_rate_hz=mixed_rate)
+                    ),
+                    mixed_rate,
+                    1,
+                    now_monotonic=now_monotonic,
+                )
+
+        while not asr_task_queue.full():
+            task = planner.pop_next_ready_task(now_monotonic=now_monotonic)
+            if task is None:
+                break
+            _enqueue_interval_task(task_queue=asr_task_queue, task=task)
+
+        final_tasks = planner.build_final_tasks(now_monotonic=now_monotonic)
+        for task in final_tasks:
+            while not _enqueue_interval_task(task_queue=asr_task_queue, task=task):
+                _drain_asr_results(
+                    result_queue=asr_result_queue,
+                    gate_state=live_gate_state,
+                    writer=writer,
+                    config=config,
+                    performance=performance,
+                    started_at=time.perf_counter(),
+                )
+                if asr_thread is None or not asr_thread.is_alive():
+                    break
+                asr_backlog_s = _estimate_asr_backlog_seconds(
+                    planner_backlog_s=planner.pending_backlog_seconds(),
+                    queued_tasks=asr_task_queue.qsize(),
+                    interval_s=config.notes_interval_seconds,
+                )
+                performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
+                _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
+                time.sleep(0.01)
+
+        asr_backlog_s = _estimate_asr_backlog_seconds(
+            planner_backlog_s=planner.pending_backlog_seconds(),
+            queued_tasks=asr_task_queue.qsize(),
+            interval_s=config.notes_interval_seconds,
+        )
+        performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
+        _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
+
+        while True:
+            try:
+                asr_task_queue.put_nowait(None)
+                break
+            except queue.Full:
+                _drain_asr_results(
+                    result_queue=asr_result_queue,
+                    gate_state=live_gate_state,
+                    writer=writer,
+                    config=config,
+                    performance=performance,
+                    started_at=time.perf_counter(),
+                )
+                if asr_thread is None or not asr_thread.is_alive():
+                    break
+                asr_backlog_s = _estimate_asr_backlog_seconds(
+                    planner_backlog_s=planner.pending_backlog_seconds(),
+                    queued_tasks=asr_task_queue.qsize(),
+                    interval_s=config.notes_interval_seconds,
+                )
+                performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
+                _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
+                time.sleep(0.01)
+
+        if asr_thread is not None:
+            while asr_thread.is_alive():
+                _drain_asr_results(
+                    result_queue=asr_result_queue,
+                    gate_state=live_gate_state,
+                    writer=writer,
+                    config=config,
+                    performance=performance,
+                    started_at=time.perf_counter(),
+                )
+                asr_backlog_s = _estimate_asr_backlog_seconds(
+                    planner_backlog_s=planner.pending_backlog_seconds(),
+                    queued_tasks=asr_task_queue.qsize(),
+                    interval_s=config.notes_interval_seconds,
+                )
+                performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
+                _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
+                asr_thread.join(timeout=0.1)
+
+        _drain_asr_results(
+            result_queue=asr_result_queue,
+            gate_state=live_gate_state,
+            writer=writer,
+            config=config,
+            performance=performance,
+            started_at=time.perf_counter(),
+        )
+        performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=0.0)
+        _render_live_status(asr_backlog_s=0.0, include_shutdown_notice=True)
+        pending_live = live_gate_state.drain_pending(force_low_conf=True)
+        _write_committed_lines(
+            committed=cast(list[object], pending_live),
+            writer=writer,
+            config=config,
+            performance=performance,
+            started_at=time.perf_counter(),
+        )
+        performance.record_end_to_notes(
+            elapsed_seconds=time.perf_counter() - finalization_started_at
+        )
+
+        if mic_capture is not None:
+            mic_capture.close()
+        if system_capture is not None:
+            system_capture.close()
+        if spool is not None:
+            spool.cleanup(keep_files=spool_keep_files)
+
+    return stopped_by_user
+
+
 @app.command("devices")
 def devices_command(
     device_type: str | None = typer.Option(None, "--type", help="input|output|loopback|monitor"),
@@ -316,6 +1005,31 @@ def start_command(
         "--capture-queue-warn-seconds",
         help="Warn when estimated live capture backlog exceeds this many seconds.",
     ),
+    notes_interval_seconds: float | None = typer.Option(
+        None,
+        "--notes-interval-seconds",
+        help="Interval size (seconds) for notes-first background ASR windows.",
+    ),
+    notes_overlap_seconds: float | None = typer.Option(
+        None,
+        "--notes-overlap-seconds",
+        help="Overlap size (seconds) between consecutive notes-first ASR windows.",
+    ),
+    notes_commit_holdback_windows: int | None = typer.Option(
+        None,
+        "--notes-commit-holdback-windows",
+        help="How many ASR windows to hold back before committing notes.",
+    ),
+    asr_backlog_warn_seconds: float | None = typer.Option(
+        None,
+        "--asr-backlog-warn-seconds",
+        help="Warn when estimated ASR backlog exceeds this many seconds.",
+    ),
+    keep_spool: bool | None = typer.Option(
+        None,
+        "--keep-spool/--no-keep-spool",
+        help="Keep raw spool files for post-run debugging/recovery.",
+    ),
     serve: bool = typer.Option(
         False,
         "--serve",
@@ -370,6 +1084,11 @@ def start_command(
         confidence_threshold=confidence_threshold,
         wall_flush_seconds=wall_flush_seconds,
         capture_queue_warn_seconds=capture_queue_warn_seconds,
+        notes_interval_seconds=notes_interval_seconds,
+        notes_overlap_seconds=notes_overlap_seconds,
+        notes_commit_holdback_windows=notes_commit_holdback_windows,
+        asr_backlog_warn_seconds=asr_backlog_warn_seconds,
+        keep_spool=keep_spool,
         bind=bind,
         port=port,
         model_dir_faster_whisper=model_dir_faster_whisper,
@@ -449,7 +1168,22 @@ def start_command(
                 typer.echo(render_ascii_qr(running_server.access_url))
 
         with TranscriptWriter(config.out) as writer:
-            audio_chunker = OverlapChunker(chunk_duration_s=6.0, overlap_duration_s=1.5)
+            if sys.stdin.isatty():
+                stopped_by_user = _run_tty_notes_first(
+                    config=config,
+                    mic_device=mic_device,
+                    system_device=system_device,
+                    all_devices=all_devices,
+                    engine_instance=engine_instance,
+                    writer=writer,
+                    performance=performance,
+                    started_at=started_at,
+                    mixed_resync_state=mixed_resync_state,
+                )
+                if stopped_by_user:
+                    typer.echo("\nStopped.")
+                return
+            audio_chunker = OverlapChunker(chunk_duration_s=2.0, overlap_duration_s=0.5)
             if sys.stdin.isatty():
                 if config.mode in {"mic", "mixed"} and mic_device is not None:
                     mic_capture = open_mic_capture(device=mic_device)

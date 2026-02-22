@@ -37,6 +37,11 @@ ENV_KEYS: dict[str, str] = {
     "confidence_threshold": "NARADA_CONFIDENCE_THRESHOLD",
     "wall_flush_seconds": "NARADA_WALL_FLUSH_SECONDS",
     "capture_queue_warn_seconds": "NARADA_CAPTURE_QUEUE_WARN_SECONDS",
+    "notes_interval_seconds": "NARADA_NOTES_INTERVAL_SECONDS",
+    "notes_overlap_seconds": "NARADA_NOTES_OVERLAP_SECONDS",
+    "notes_commit_holdback_windows": "NARADA_NOTES_COMMIT_HOLDBACK_WINDOWS",
+    "asr_backlog_warn_seconds": "NARADA_ASR_BACKLOG_WARN_SECONDS",
+    "keep_spool": "NARADA_KEEP_SPOOL",
     "bind": "NARADA_BIND",
     "port": "NARADA_PORT",
     "model_dir_faster_whisper": "NARADA_MODEL_DIR_FASTER_WHISPER",
@@ -87,6 +92,11 @@ class RuntimeConfig:
     confidence_threshold: float
     wall_flush_seconds: float
     capture_queue_warn_seconds: float
+    notes_interval_seconds: float
+    notes_overlap_seconds: float
+    notes_commit_holdback_windows: int
+    asr_backlog_warn_seconds: float
+    keep_spool: bool
     bind: str
     port: int
     model_dir_faster_whisper: Path | None
@@ -112,6 +122,11 @@ class ConfigOverrides:
     confidence_threshold: float | None = None
     wall_flush_seconds: float | None = None
     capture_queue_warn_seconds: float | None = None
+    notes_interval_seconds: float | None = None
+    notes_overlap_seconds: float | None = None
+    notes_commit_holdback_windows: int | None = None
+    asr_backlog_warn_seconds: float | None = None
+    keep_spool: bool | None = None
     bind: str | None = None
     port: int | None = None
     model_dir_faster_whisper: Path | None = None
@@ -307,6 +322,41 @@ def build_runtime_config(
         env_values.get("capture_queue_warn_seconds"),
         "120.0",
     )
+    notes_interval_seconds_raw = _choose_string(
+        str(overrides.notes_interval_seconds)
+        if overrides.notes_interval_seconds is not None
+        else None,
+        env_values.get("notes_interval_seconds"),
+        "12.0",
+    )
+    notes_overlap_seconds_raw = _choose_string(
+        (
+            str(overrides.notes_overlap_seconds)
+            if overrides.notes_overlap_seconds is not None
+            else None
+        ),
+        env_values.get("notes_overlap_seconds"),
+        "1.5",
+    )
+    notes_commit_holdback_raw = _choose_string(
+        str(overrides.notes_commit_holdback_windows)
+        if overrides.notes_commit_holdback_windows is not None
+        else None,
+        env_values.get("notes_commit_holdback_windows"),
+        "1",
+    )
+    asr_backlog_warn_seconds_raw = _choose_string(
+        str(overrides.asr_backlog_warn_seconds)
+        if overrides.asr_backlog_warn_seconds is not None
+        else None,
+        env_values.get("asr_backlog_warn_seconds"),
+        "45.0",
+    )
+    keep_spool_raw = _choose_string(
+        str(overrides.keep_spool).lower() if overrides.keep_spool is not None else None,
+        env_values.get("keep_spool"),
+        "false",
+    )
     bind = _choose_string(overrides.bind, env_values.get("bind"), "0.0.0.0")
     port_raw = _choose_string(
         str(overrides.port) if overrides.port is not None else None,
@@ -333,6 +383,27 @@ def build_runtime_config(
         raise ConfigError(
             f"Invalid capture queue warning threshold: '{capture_queue_warn_seconds_raw}'."
         ) from exc
+    try:
+        notes_interval_seconds = float(notes_interval_seconds_raw)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid notes interval: '{notes_interval_seconds_raw}'.") from exc
+    try:
+        notes_overlap_seconds = float(notes_overlap_seconds_raw)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid notes overlap: '{notes_overlap_seconds_raw}'.") from exc
+    try:
+        notes_commit_holdback_windows = int(notes_commit_holdback_raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"Invalid notes commit holdback windows: '{notes_commit_holdback_raw}'."
+        ) from exc
+    try:
+        asr_backlog_warn_seconds = float(asr_backlog_warn_seconds_raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"Invalid ASR backlog warning threshold: '{asr_backlog_warn_seconds_raw}'."
+        ) from exc
+    keep_spool = _parse_bool(keep_spool_raw, "keep_spool")
 
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ConfigError("Confidence threshold must be between 0.0 and 1.0.")
@@ -340,6 +411,16 @@ def build_runtime_config(
         raise ConfigError("Wall flush seconds must be >= 0.0.")
     if capture_queue_warn_seconds <= 0.0:
         raise ConfigError("Capture queue warning threshold must be > 0.0.")
+    if notes_interval_seconds <= 0.0:
+        raise ConfigError("Notes interval must be > 0.0.")
+    if notes_overlap_seconds < 0.0:
+        raise ConfigError("Notes overlap must be >= 0.0.")
+    if notes_overlap_seconds >= notes_interval_seconds:
+        raise ConfigError("Notes overlap must be smaller than notes interval.")
+    if notes_commit_holdback_windows < 0:
+        raise ConfigError("Notes commit holdback windows must be >= 0.")
+    if asr_backlog_warn_seconds <= 0.0:
+        raise ConfigError("ASR backlog warning threshold must be > 0.0.")
 
     try:
         port = int(port_raw)
@@ -381,6 +462,11 @@ def build_runtime_config(
         confidence_threshold=confidence_threshold,
         wall_flush_seconds=wall_flush_seconds,
         capture_queue_warn_seconds=capture_queue_warn_seconds,
+        notes_interval_seconds=notes_interval_seconds,
+        notes_overlap_seconds=notes_overlap_seconds,
+        notes_commit_holdback_windows=notes_commit_holdback_windows,
+        asr_backlog_warn_seconds=asr_backlog_warn_seconds,
+        keep_spool=keep_spool,
         bind=bind,
         port=port,
         model_dir_faster_whisper=model_dir_faster_whisper,

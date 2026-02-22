@@ -20,11 +20,18 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - Shared logical IDs for combo devices; Narada auto-selects input/output endpoint by command context.
 - `--language auto` default with multilingual input support through comma-separated values.
 - Software mixed mode target (mic + system in Narada).
-- Continuous live capture for mic/system modes with wall-clock forced flush controls.
+- Continuous live capture for mic/system modes with low-latency chunk defaults
+  (2.0s chunk, 0.5s overlap) and wall-clock forced flush controls.
+- Notes-first live runtime for TTY sessions: audio is continuously spooled to disk,
+  interval ASR runs in a background worker, and finalization performs a tail pass.
 - Core PII redaction support (excluding names).
 - Append-only transcript writing with frequent flush and fsync.
 - Automatic hardware channel count detection for system capture; stereo WASAPI loopback devices are opened at their native channel count and downmixed to mono before ASR. If the detected count is rejected by the driver, Narada retries automatically through common fallback values (2, 1) before raising an error.
 - Optional LAN serving directly from `narada start --serve`.
+- For faster-whisper on `--compute auto|cuda`, Narada automatically falls back to
+  CPU for the current session if GPU runtime/transcription worker errors or timeouts occur.
+- For whisper.cpp, Narada probes `whisper-cli` flag support at runtime and logs
+  the resolved compute behavior (for example CPU no-GPU flags and backend hints).
 - LAN live view endpoints:
   - `/` browser page
   - `/transcript.txt` raw transcript file
@@ -124,6 +131,11 @@ Tune live wall-clock flush and capture backlog warnings:
 narada start --mode system --system 7 --out ./transcripts/session.txt --wall-flush-seconds 60 --capture-queue-warn-seconds 120
 ```
 
+Tune notes-first interval scheduling and spool retention:
+```bash
+narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --notes-interval-seconds 12 --notes-overlap-seconds 1.5 --notes-commit-holdback-windows 1 --asr-backlog-warn-seconds 45 --keep-spool
+```
+
 Enable debug logging:
 ```bash
 narada --debug --log-file ./logs/narada.log start --mode mic --mic 1
@@ -187,5 +199,10 @@ Environment variable map:
 - `NARADA_CONFIDENCE_THRESHOLD` -> `--confidence-threshold`
 - `NARADA_WALL_FLUSH_SECONDS` -> `--wall-flush-seconds`
 - `NARADA_CAPTURE_QUEUE_WARN_SECONDS` -> `--capture-queue-warn-seconds`
+- `NARADA_NOTES_INTERVAL_SECONDS` -> `--notes-interval-seconds`
+- `NARADA_NOTES_OVERLAP_SECONDS` -> `--notes-overlap-seconds`
+- `NARADA_NOTES_COMMIT_HOLDBACK_WINDOWS` -> `--notes-commit-holdback-windows`
+- `NARADA_ASR_BACKLOG_WARN_SECONDS` -> `--asr-backlog-warn-seconds`
+- `NARADA_KEEP_SPOOL` -> `--keep-spool/--no-keep-spool`
 - `NARADA_BIND` -> `--bind`
 - `NARADA_PORT` -> `--port`

@@ -92,6 +92,35 @@ def test_capture_handle_raises_disconnected_error() -> None:
     assert stream.closed
 
 
+def test_capture_handle_stats_snapshot_tracks_emitted_and_dropped_frames() -> None:
+    stream = _FakeStream(
+        frames=[
+            (b"\x01\x00", False),
+            (b"\x01\x00", True),
+            (b"\x01\x00", False),
+        ]
+    )
+    handle = CaptureHandle(
+        stream=stream,
+        sample_rate_hz=16000,
+        channels=1,
+        blocksize=1,
+        device_name="StatsMic",
+    )
+    frame1 = handle.read_frame()
+    frame2 = handle.read_frame()
+    frame3 = handle.read_frame()
+    stats = handle.stats_snapshot()
+
+    assert frame1 is not None
+    assert frame2 is None
+    assert frame3 is not None
+    assert stats.frames_emitted == 2
+    assert stats.dropped_frames == 1
+    assert stats.overflow_frames == 1
+    assert stats.bytes_emitted == 4
+
+
 def test_capture_handle_native_channels_defaults_to_channels() -> None:
     stream = _FakeStream(frames=[(b"\x01\x00\xff\x7f", False)])
     handle = CaptureHandle(

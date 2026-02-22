@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -37,6 +39,9 @@ class _FakeCapture:
     def close(self) -> None:
         self.closed = True
 
+    def stats_snapshot(self) -> SimpleNamespace:
+        return SimpleNamespace(dropped_frames=0)
+
 
 @dataclass
 class _FailingCapture:
@@ -50,6 +55,9 @@ class _FailingCapture:
 
     def close(self) -> None:
         self.closed = True
+
+    def stats_snapshot(self) -> SimpleNamespace:
+        return SimpleNamespace(dropped_frames=0)
 
 
 @dataclass
@@ -85,12 +93,37 @@ class _FakeEngine(AsrEngine):
         ]
 
 
+class _RecordingSampleRateEngine(_FakeEngine):
+    def __init__(self, text: str) -> None:
+        super().__init__(text=text)
+        self.sample_rates: list[int] = []
+
+    def transcribe(self, request: TranscriptionRequest) -> list[TranscriptSegment]:
+        self.sample_rates.append(request.sample_rate_hz)
+        return super().transcribe(request)
+
+
+class _SlowEngine(_FakeEngine):
+    def __init__(self, text: str, delay_s: float) -> None:
+        super().__init__(text=text)
+        self.delay_s = delay_s
+
+    def transcribe(self, request: TranscriptionRequest) -> list[TranscriptSegment]:
+        threading.Event().wait(self.delay_s)
+        return super().transcribe(request)
+
+
 def _runtime_config(
     mode: str,
     out_path: Path,
     *,
     wall_flush_seconds: float = 60.0,
     capture_queue_warn_seconds: float = 120.0,
+    notes_interval_seconds: float = 12.0,
+    notes_overlap_seconds: float = 1.5,
+    notes_commit_holdback_windows: int = 1,
+    asr_backlog_warn_seconds: float = 45.0,
+    keep_spool: bool = False,
 ) -> RuntimeConfig:
     return RuntimeConfig(
         mode=mode,  # type: ignore[arg-type]
@@ -110,6 +143,11 @@ def _runtime_config(
         confidence_threshold=0.65,
         wall_flush_seconds=wall_flush_seconds,
         capture_queue_warn_seconds=capture_queue_warn_seconds,
+        notes_interval_seconds=notes_interval_seconds,
+        notes_overlap_seconds=notes_overlap_seconds,
+        notes_commit_holdback_windows=notes_commit_holdback_windows,
+        asr_backlog_warn_seconds=asr_backlog_warn_seconds,
+        keep_spool=keep_spool,
         bind="127.0.0.1",
         port=8787,
         model_dir_faster_whisper=None,
@@ -244,6 +282,85 @@ def test_start_integration_mixed_mode(monkeypatch: Any, tmp_path: Path) -> None:
     assert mic_capture.closed
     assert system_capture.closed
     assert fake_engine.calls >= 1
+
+
+def test_start_notes_first_slow_engine_still_commits_tail(monkeypatch: Any, tmp_path: Path) -> None:
+    out_path = tmp_path / "slow-tail.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("slow transcript", delay_s=0.03)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(24)])
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=5))
+
+    _run_start_for_tests()
+
+    assert "slow transcript" in out_path.read_text(encoding="utf-8")
+    assert mic_capture.closed
+    assert slow_engine.calls >= 1
+
+
+def test_start_interrupt_displays_asr_shutdown_notice(
+    monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_path = tmp_path / "shutdown-notice.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("shutdown notice transcript", delay_s=0.02)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(20)])
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=4))
+
+    _run_start_for_tests()
+
+    captured = capsys.readouterr()
+    assert "Application stopping. ASR completing first." in captured.out
+    assert "Will stop in about" in captured.out
+    assert "shutdown notice transcript" in out_path.read_text(encoding="utf-8")
 
 
 def test_start_falls_back_to_recommended_engine(monkeypatch: Any, tmp_path: Path) -> None:
@@ -417,9 +534,92 @@ def test_start_wall_flush_commits_without_waiting_for_chunk_duration(
     assert fake_engine.calls >= 1
 
 
-def test_start_live_loop_uses_idle_sleep_not_one_second(
+def test_start_uses_notes_interval_planner_defaults(monkeypatch: Any, tmp_path: Path) -> None:
+    out_path = tmp_path / "planner-defaults.txt"
+    cfg = _runtime_config("mic", out_path)
+    fake_engine = _FakeEngine("planner defaults transcript")
+    mic_capture = _FakeCapture(frames=[_frame()])
+    captured: dict[str, float] = {}
+
+    from narada.live_notes import IntervalPlanner as RealIntervalPlanner
+
+    def fake_planner(*args: object, **kwargs: object) -> RealIntervalPlanner:
+        captured["interval_seconds"] = float(kwargs.get("interval_seconds", -1.0))
+        captured["overlap_seconds"] = float(kwargs.get("overlap_seconds", -1.0))
+        return RealIntervalPlanner(*args, **kwargs)
+
+    monkeypatch.setattr("narada.cli.IntervalPlanner", fake_planner)
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=3))
+
+    _run_start_for_tests()
+
+    assert captured["interval_seconds"] == 12.0
+    assert captured["overlap_seconds"] == 1.5
+
+
+def test_start_preserves_live_frame_sample_rate_in_transcription_request(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
+    out_path = tmp_path / "sample-rate-pass-through.txt"
+    cfg = _runtime_config("mic", out_path, wall_flush_seconds=0.5)
+    recording_engine = _RecordingSampleRateEngine("sample rate transcript")
+    high_rate_frame = CapturedFrame(pcm_bytes=b"\x00\x00\x10\x00", sample_rate_hz=48000, channels=1)
+    mic_capture = _FakeCapture(frames=[high_rate_frame], sample_rate_hz=48000)
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: recording_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=3))
+
+    clock = {"value": 0.0}
+
+    def _fake_monotonic() -> float:
+        clock["value"] += 1.0
+        return clock["value"]
+
+    monkeypatch.setattr("narada.cli.time.monotonic", _fake_monotonic)
+
+    _run_start_for_tests()
+
+    assert recording_engine.sample_rates
+    assert recording_engine.sample_rates[0] == 48000
+    assert "sample rate transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_live_loop_uses_idle_sleep_not_one_second(monkeypatch: Any, tmp_path: Path) -> None:
     out_path = tmp_path / "idle-sleep.txt"
     cfg = _runtime_config("mic", out_path)
     fake_engine = _FakeEngine("idle sleep transcript")

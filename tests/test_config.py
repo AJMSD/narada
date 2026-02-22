@@ -28,6 +28,11 @@ def test_default_output_path_is_generated_when_missing() -> None:
     assert config.out.suffix == ".txt"
     assert config.wall_flush_seconds == 60.0
     assert config.capture_queue_warn_seconds == 120.0
+    assert config.notes_interval_seconds == 12.0
+    assert config.notes_overlap_seconds == 1.5
+    assert config.notes_commit_holdback_windows == 1
+    assert config.asr_backlog_warn_seconds == 45.0
+    assert config.keep_spool is False
 
 
 def test_multilingual_requires_explicit_flag() -> None:
@@ -63,10 +68,20 @@ def test_wall_flush_and_queue_warning_threshold_loaded_from_env() -> None:
         "NARADA_MIC": "1",
         "NARADA_WALL_FLUSH_SECONDS": "30.0",
         "NARADA_CAPTURE_QUEUE_WARN_SECONDS": "15.0",
+        "NARADA_NOTES_INTERVAL_SECONDS": "9.0",
+        "NARADA_NOTES_OVERLAP_SECONDS": "1.0",
+        "NARADA_NOTES_COMMIT_HOLDBACK_WINDOWS": "2",
+        "NARADA_ASR_BACKLOG_WARN_SECONDS": "50.0",
+        "NARADA_KEEP_SPOOL": "true",
     }
     config = build_runtime_config(ConfigOverrides(), env=env)
     assert config.wall_flush_seconds == 30.0
     assert config.capture_queue_warn_seconds == 15.0
+    assert config.notes_interval_seconds == 9.0
+    assert config.notes_overlap_seconds == 1.0
+    assert config.notes_commit_holdback_windows == 2
+    assert config.asr_backlog_warn_seconds == 50.0
+    assert config.keep_spool is True
 
 
 def test_wall_flush_and_queue_warning_threshold_validate_ranges() -> None:
@@ -78,3 +93,14 @@ def test_wall_flush_and_queue_warning_threshold_validate_ranges() -> None:
         build_runtime_config(ConfigOverrides(wall_flush_seconds=-1.0), env=env)
     with pytest.raises(ConfigError):
         build_runtime_config(ConfigOverrides(capture_queue_warn_seconds=0.0), env=env)
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(notes_interval_seconds=0.0), env=env)
+    with pytest.raises(ConfigError):
+        build_runtime_config(
+            ConfigOverrides(notes_interval_seconds=10.0, notes_overlap_seconds=10.0),
+            env=env,
+        )
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(notes_commit_holdback_windows=-1), env=env)
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(asr_backlog_warn_seconds=0.0), env=env)

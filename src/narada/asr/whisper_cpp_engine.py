@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,16 +20,26 @@ logger = logging.getLogger("narada.asr.whisper_cpp")
 
 
 @dataclass(frozen=True)
+class WhisperCliCapabilities:
+    no_gpu_flag: str | None
+    gpu_layers_flag: str | None
+    backend_hints: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class WhisperCppRuntime:
     cli_path: str
     model_path: Path
-    gpu_layers: int
+    requested_compute: str
+    compute_args: tuple[str, ...]
+    capabilities: WhisperCliCapabilities
 
 
 class WhisperCppEngine:
     name = "whisper-cpp"
     _runtime_cache: ClassVar[dict[tuple[str, str], WhisperCppRuntime]] = {}
     _warmed: ClassVar[set[tuple[str, str]]] = set()
+    _capability_cache: ClassVar[dict[str, WhisperCliCapabilities]] = {}
     _cache_lock: ClassVar[Lock] = Lock()
 
     def __init__(
@@ -79,9 +90,8 @@ class WhisperCppEngine:
                 str(output_base),
                 "-otxt",
                 "-np",
-                "-ng",
-                str(runtime.gpu_layers),
             ]
+            cmd.extend(runtime.compute_args)
             language = self._choose_language(request.languages)
             if language is not None:
                 cmd.extend(["-l", language])
@@ -115,6 +125,7 @@ class WhisperCppEngine:
         with cls._cache_lock:
             cls._runtime_cache.clear()
             cls._warmed.clear()
+            cls._capability_cache.clear()
 
     @staticmethod
     def _choose_language(languages: tuple[str, ...]) -> str | None:
@@ -144,18 +155,86 @@ class WhisperCppEngine:
         return None
 
     @staticmethod
-    def _resolve_compute(compute: str) -> int:
+    def _normalize_compute(compute: str) -> str:
         normalized = compute.strip().lower()
-        if normalized in {"auto", "cpu"}:
-            return 0
-        if normalized == "cuda":
-            return 99
-        if normalized == "metal":
-            return 99
+        if normalized in {"auto", "cpu", "cuda", "metal"}:
+            return normalized
         raise EngineUnavailableError(f"Unsupported compute backend '{compute}' for whisper.cpp.")
 
+    @staticmethod
+    def _detect_backend_hint(help_text: str) -> tuple[str, ...]:
+        normalized = help_text.lower()
+        ordered_hints = ("cuda", "metal", "vulkan", "opencl", "hip", "blas")
+        detected = [hint for hint in ordered_hints if hint in normalized]
+        return tuple(detected)
+
+    def probe_cli_capabilities(self) -> WhisperCliCapabilities:
+        cli_path = self._which_fn("whisper-cli")
+        if cli_path is None:
+            raise EngineUnavailableError(
+                "whisper-cli binary not found on PATH. Install whisper.cpp CLI for transcription."
+            )
+        with self._cache_lock:
+            cached = self._capability_cache.get(cli_path)
+            if cached is not None:
+                return cached
+
+        help_text = ""
+        for help_arg in ("-h", "--help"):
+            result = self._run_fn(
+                [cli_path, help_arg],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            help_text = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+            if help_text:
+                break
+
+        if not help_text:
+            logger.warning(
+                "Could not read whisper-cli help output; "
+                "compute compatibility detection is limited."
+            )
+
+        no_gpu_flag: str | None = None
+        if "--no-gpu" in help_text:
+            no_gpu_flag = "--no-gpu"
+        elif re.search(r"(?<![\w-])-ng(?![\w-])", help_text):
+            no_gpu_flag = "-ng"
+
+        gpu_layers_flag: str | None = None
+        if "--gpu-layers" in help_text:
+            gpu_layers_flag = "--gpu-layers"
+        elif re.search(r"(?<![\w-])-ngl(?![\w-])", help_text):
+            gpu_layers_flag = "-ngl"
+
+        capabilities = WhisperCliCapabilities(
+            no_gpu_flag=no_gpu_flag,
+            gpu_layers_flag=gpu_layers_flag,
+            backend_hints=self._detect_backend_hint(help_text),
+        )
+        with self._cache_lock:
+            self._capability_cache[cli_path] = capabilities
+        return capabilities
+
+    def _build_compute_args(
+        self, compute: str, capabilities: WhisperCliCapabilities
+    ) -> tuple[str, ...]:
+        normalized = self._normalize_compute(compute)
+        if normalized == "cpu":
+            if capabilities.no_gpu_flag is not None:
+                return (capabilities.no_gpu_flag,)
+            logger.warning(
+                "whisper.cpp CLI does not advertise a no-GPU flag; compute=cpu "
+                "cannot be strictly enforced for this runtime."
+            )
+            return ()
+        return ()
+
     def _resolve_runtime(self, model_name: str, compute: str) -> WhisperCppRuntime:
-        cache_key = (model_name, compute.lower())
+        normalized_compute = self._normalize_compute(compute)
+        cache_key = (model_name, normalized_compute)
         with self._cache_lock:
             cached = self._runtime_cache.get(cache_key)
             if cached is not None:
@@ -167,11 +246,24 @@ class WhisperCppEngine:
                 "whisper-cli binary not found on PATH. Install whisper.cpp CLI for transcription."
             )
         model_path = self._resolve_model_path(model_name)
-        gpu_layers = self._resolve_compute(compute)
+        capabilities = self.probe_cli_capabilities()
+        compute_args = self._build_compute_args(normalized_compute, capabilities)
         runtime = WhisperCppRuntime(
             cli_path=cli_path,
             model_path=model_path,
-            gpu_layers=gpu_layers,
+            requested_compute=normalized_compute,
+            compute_args=compute_args,
+            capabilities=capabilities,
+        )
+        hint_text = (
+            ", ".join(capabilities.backend_hints) if capabilities.backend_hints else "unknown"
+        )
+        args_text = " ".join(compute_args) if compute_args else "<none>"
+        logger.info(
+            "whisper.cpp compute resolved: request=%s args=%s backend_hints=%s",
+            normalized_compute,
+            args_text,
+            hint_text,
         )
 
         with self._cache_lock:
@@ -180,7 +272,7 @@ class WhisperCppEngine:
 
     @classmethod
     def _warmup(cls, runtime: WhisperCppRuntime) -> None:
-        key = (str(runtime.model_path), str(runtime.gpu_layers))
+        key = (str(runtime.model_path), " ".join(runtime.compute_args))
         with cls._cache_lock:
             if key in cls._warmed:
                 return
