@@ -25,11 +25,16 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - Notes-first live runtime for TTY sessions: audio is continuously spooled to disk,
   interval ASR runs in a background worker, and finalization performs a tail pass.
 - Core PII redaction support (excluding names).
-- Append-only transcript writing with frequent flush and fsync.
+- Append-only transcript writing with configurable fsync policy
+  (default remains per-line fsync).
+- Notes spool flushing is batched by interval/byte thresholds and remains
+  durably fsynced on close.
 - Automatic hardware channel count detection for system capture; stereo WASAPI loopback devices are opened at their native channel count and downmixed to mono before ASR. If the detected count is rejected by the driver, Narada retries automatically through common fallback values (2, 1) before raising an error.
 - Optional LAN serving directly from `narada start --serve`.
+- Optional LAN token auth via `--serve-token` for `/`, `/transcript.txt`, and `/events`.
 - For faster-whisper on `--compute auto|cuda`, Narada automatically falls back to
   CPU for the current session if GPU runtime/transcription worker errors or timeouts occur.
+- Faster-whisper decode presets: `fast`, `balanced` (default), `accurate`.
 - For whisper.cpp, Narada probes `whisper-cli` flag support at runtime and logs
   the resolved compute behavior (for example CPU no-GPU flags and backend hints).
 - LAN live view endpoints:
@@ -47,6 +52,11 @@ Narada supports two engine adapters from the start:
 Select engine with:
 ```bash
 narada start --mode mic --mic 1 --engine faster-whisper
+```
+
+Select faster-whisper decode preset with:
+```bash
+narada start --mode mic --mic 1 --engine faster-whisper --asr-preset balanced
 ```
 
 ## Model Setup
@@ -136,6 +146,28 @@ Tune notes-first interval scheduling and spool retention:
 narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --notes-interval-seconds 12 --notes-overlap-seconds 1.5 --notes-commit-holdback-windows 1 --asr-backlog-warn-seconds 45 --keep-spool
 ```
 
+Tune notes spool flush batching thresholds:
+```bash
+narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --spool-flush-interval-seconds 0.25 --spool-flush-bytes 65536
+```
+
+Use compatibility mode for spool flush (flush every append):
+```bash
+narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --spool-flush-interval-seconds 0 --spool-flush-bytes 0
+```
+
+Use periodic transcript fsync mode:
+```bash
+narada start --mode mic --mic 1 --out ./transcripts/session.txt --writer-fsync-mode periodic --writer-fsync-lines 20 --writer-fsync-seconds 1.0
+```
+
+Choose faster-whisper decode presets:
+```bash
+narada start --mode mic --mic 1 --engine faster-whisper --asr-preset fast
+narada start --mode mic --mic 1 --engine faster-whisper --asr-preset balanced
+narada start --mode mic --mic 1 --engine faster-whisper --asr-preset accurate
+```
+
 Enable debug logging:
 ```bash
 narada --debug --log-file ./logs/narada.log start --mode mic --mic 1
@@ -149,6 +181,16 @@ narada start --mode mic --mic 1 --language hindi,english --allow-multilingual
 Serve transcript on LAN:
 ```bash
 narada serve --file ./transcripts/session.txt --port 8787 --qr --bind 0.0.0.0
+```
+
+Serve transcript on LAN with token auth:
+```bash
+narada serve --file ./transcripts/session.txt --port 8787 --bind 0.0.0.0 --serve-token mytoken
+```
+
+Start + serve with token auth in one command:
+```bash
+narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --serve --bind 0.0.0.0 --port 8787 --serve-token mytoken
 ```
 
 Run checks:
@@ -169,15 +211,46 @@ Structured stdin for `start` (useful for tests or automation):
 - JSON audio payload (mic/system): `{"audio":{"samples":[...],"sample_rate_hz":16000,"channels":1}}`
 - JSON mixed payload: `{"mic":{...},"system":{...}}` (Narada normalizes and software-mixes before ASR).
 
+## ASR Presets And Benchmarking
+Preset behavior for faster-whisper:
+- `fast`: lower latency and CPU, lower decode search.
+- `balanced` (default): current baseline behavior.
+- `accurate`: stronger context carry-over, highest compute of the three.
+
+Quick local benchmark recipe:
+1. Use one fixed 1-3 minute audio sample (same playback path and system load for each run).
+2. Run faster-whisper with each preset on the same model.
+3. Run whisper-cpp on the same model.
+4. Compare final `rtf=...` values in status output and compare transcript quality manually.
+
+Example commands:
+```bash
+narada start --mode system --system <id> --model small --engine faster-whisper --asr-preset fast --out ./transcripts/fw-fast.txt
+narada start --mode system --system <id> --model small --engine faster-whisper --asr-preset balanced --out ./transcripts/fw-balanced.txt
+narada start --mode system --system <id> --model small --engine faster-whisper --asr-preset accurate --out ./transcripts/fw-accurate.txt
+narada start --mode system --system <id> --model small --engine whisper-cpp --out ./transcripts/wcpp.txt
+```
+
 ## Privacy And Security Behavior
 - No telemetry by default.
 - No cloud upload by default.
 - LAN serving is opt-in and active only when running `narada serve` or `narada start --serve`.
 - Binding to `0.0.0.0` prints a warning because local-network devices can access the endpoint.
+- If `--serve-token` is set, all HTTP and SSE endpoints require `?token=<value>`.
+- If no token is configured, serving behavior remains backward compatible (no auth).
 - Redaction does not attempt named-entity inference, and personal names are intentionally not masked.
 
 ## Configuration
 Flags override environment values.
+
+Default values for new knobs:
+- `--spool-flush-interval-seconds 0.25`
+- `--spool-flush-bytes 65536`
+- `--writer-fsync-mode line`
+- `--writer-fsync-lines 20`
+- `--writer-fsync-seconds 1.0`
+- `--asr-preset balanced`
+- `--serve-token` unset (disabled)
 
 Environment variable map:
 - `NARADA_MODE` -> `--mode`
@@ -204,5 +277,12 @@ Environment variable map:
 - `NARADA_NOTES_COMMIT_HOLDBACK_WINDOWS` -> `--notes-commit-holdback-windows`
 - `NARADA_ASR_BACKLOG_WARN_SECONDS` -> `--asr-backlog-warn-seconds`
 - `NARADA_KEEP_SPOOL` -> `--keep-spool/--no-keep-spool`
+- `NARADA_SPOOL_FLUSH_INTERVAL_SECONDS` -> `--spool-flush-interval-seconds`
+- `NARADA_SPOOL_FLUSH_BYTES` -> `--spool-flush-bytes`
+- `NARADA_WRITER_FSYNC_MODE` -> `--writer-fsync-mode`
+- `NARADA_WRITER_FSYNC_LINES` -> `--writer-fsync-lines`
+- `NARADA_WRITER_FSYNC_SECONDS` -> `--writer-fsync-seconds`
+- `NARADA_ASR_PRESET` -> `--asr-preset`
+- `NARADA_SERVE_TOKEN` -> `--serve-token`
 - `NARADA_BIND` -> `--bind`
 - `NARADA_PORT` -> `--port`

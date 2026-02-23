@@ -498,12 +498,16 @@ def build_runtime_config(
     try:
         spool_flush_bytes = int(spool_flush_bytes_raw)
     except ValueError as exc:
-        raise ConfigError(f"Invalid spool flush byte threshold: '{spool_flush_bytes_raw}'.") from exc
+        raise ConfigError(
+            f"Invalid spool flush byte threshold: '{spool_flush_bytes_raw}'."
+        ) from exc
     writer_fsync_mode = _parse_writer_fsync_mode(writer_fsync_mode_raw)
     try:
         writer_fsync_lines = int(writer_fsync_lines_raw)
     except ValueError as exc:
-        raise ConfigError(f"Invalid writer fsync line threshold: '{writer_fsync_lines_raw}'.") from exc
+        raise ConfigError(
+            f"Invalid writer fsync line threshold: '{writer_fsync_lines_raw}'."
+        ) from exc
     try:
         writer_fsync_seconds = float(writer_fsync_seconds_raw)
     except ValueError as exc:
@@ -536,7 +540,11 @@ def build_runtime_config(
         raise ConfigError("Writer fsync line threshold must be >= 0.")
     if writer_fsync_seconds < 0.0:
         raise ConfigError("Writer fsync interval seconds must be >= 0.0.")
-    if writer_fsync_mode == "periodic" and writer_fsync_lines == 0 and writer_fsync_seconds == 0.0:
+    if (
+        writer_fsync_mode == "periodic"
+        and writer_fsync_lines == 0
+        and writer_fsync_seconds == 0.0
+    ):
         raise ConfigError(
             "Writer fsync periodic mode requires writer_fsync_lines > 0 or "
             "writer_fsync_seconds > 0."

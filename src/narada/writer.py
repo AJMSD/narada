@@ -41,7 +41,9 @@ class TranscriptWriter:
         self._handle.flush()
         os.fsync(self._handle.fileno())
         self._lines_since_fsync = 0
-        self._last_fsync_monotonic = now_monotonic if now_monotonic is not None else time.monotonic()
+        self._last_fsync_monotonic = (
+            now_monotonic if now_monotonic is not None else time.monotonic()
+        )
 
     def append_line(self, text: str) -> None:
         cleaned = text.strip()

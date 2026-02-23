@@ -93,7 +93,9 @@ class SessionSpool:
         self._data_handle.flush()
         self._index_handle.flush()
         self._bytes_since_flush = 0
-        self._last_flush_monotonic = now_monotonic if now_monotonic is not None else time.monotonic()
+        self._last_flush_monotonic = (
+            now_monotonic if now_monotonic is not None else time.monotonic()
+        )
 
     @property
     def total_bytes(self) -> int:

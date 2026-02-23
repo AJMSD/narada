@@ -1040,7 +1040,10 @@ def start_command(
     spool_flush_interval_seconds: float | None = typer.Option(
         None,
         "--spool-flush-interval-seconds",
-        help="Flush live spool files at this interval (seconds). Use 0 to disable interval trigger.",
+        help=(
+            "Flush live spool files at this interval (seconds). "
+            "Use 0 to disable interval trigger."
+        ),
     ),
     spool_flush_bytes: int | None = typer.Option(
         None,
@@ -1220,7 +1223,8 @@ def start_command(
                 typer.echo("Warning: server bound to all interfaces on local network.")
                 if config.serve_token is None:
                     typer.echo(
-                        "Warning: LAN server is unauthenticated. Set --serve-token to require access."
+                        "Warning: LAN server is unauthenticated. "
+                        "Set --serve-token to require access."
                     )
             if qr:
                 typer.echo(render_ascii_qr(running_server.access_url))
