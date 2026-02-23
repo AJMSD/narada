@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from narada.live_notes import IntervalPlanner, SessionSpool, SpoolRecord
 
 
@@ -27,6 +29,48 @@ def test_session_spool_appends_and_reads_ranges(tmp_path: Path) -> None:
     directory = spool.directory
     spool.cleanup(keep_files=False)
     assert not directory.exists()
+
+
+def test_session_spool_compat_flush_mode_flushes_every_append(tmp_path: Path) -> None:
+    spool = SessionSpool(
+        base_dir=tmp_path,
+        prefix="narada-test",
+        flush_interval_seconds=0.0,
+        flush_bytes=0,
+    )
+    frame = b"\x01\x00" * 2
+    spool.append_frame(pcm_bytes=frame, sample_rate_hz=4, channels=1)
+
+    assert spool.data_path.read_bytes() == frame
+    lines = spool.index_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+
+    spool.cleanup(keep_files=False)
+
+
+def test_session_spool_flushes_when_byte_threshold_reached(tmp_path: Path) -> None:
+    spool = SessionSpool(
+        base_dir=tmp_path,
+        prefix="narada-test",
+        flush_interval_seconds=0.0,
+        flush_bytes=8,
+    )
+    first = b"\x01\x00" * 2
+    second = b"\x02\x00" * 2
+    spool.append_frame(pcm_bytes=first, sample_rate_hz=4, channels=1)
+    assert spool.data_path.read_bytes() == b""
+
+    spool.append_frame(pcm_bytes=second, sample_rate_hz=4, channels=1)
+    assert spool.data_path.read_bytes() == first + second
+
+    spool.cleanup(keep_files=False)
+
+
+def test_session_spool_rejects_negative_flush_thresholds(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        SessionSpool(base_dir=tmp_path, flush_interval_seconds=-0.1)
+    with pytest.raises(ValueError):
+        SessionSpool(base_dir=tmp_path, flush_bytes=-1)
 
 
 def test_interval_planner_emits_overlap_windows_and_final_tail() -> None:

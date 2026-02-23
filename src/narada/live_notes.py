@@ -60,7 +60,18 @@ class AsrResult:
 
 
 class SessionSpool:
-    def __init__(self, *, base_dir: Path, prefix: str = "narada-spool") -> None:
+    def __init__(
+        self,
+        *,
+        base_dir: Path,
+        prefix: str = "narada-spool",
+        flush_interval_seconds: float = 0.25,
+        flush_bytes: int = 65536,
+    ) -> None:
+        if flush_interval_seconds < 0.0:
+            raise ValueError("flush_interval_seconds must be >= 0.0.")
+        if flush_bytes < 0:
+            raise ValueError("flush_bytes must be >= 0.")
         session_dir = tempfile.mkdtemp(prefix=f"{prefix}-", dir=str(base_dir))
         self.directory = Path(session_dir)
         self.data_path = self.directory / "audio.pcm16le"
@@ -73,6 +84,16 @@ class SessionSpool:
         self._records: list[SpoolRecord] = []
         self._lock = threading.Lock()
         self._closed = False
+        self._flush_interval_seconds = flush_interval_seconds
+        self._flush_bytes = flush_bytes
+        self._bytes_since_flush = 0
+        self._last_flush_monotonic = time.monotonic()
+
+    def _flush_pending_handles(self, *, now_monotonic: float | None = None) -> None:
+        self._data_handle.flush()
+        self._index_handle.flush()
+        self._bytes_since_flush = 0
+        self._last_flush_monotonic = now_monotonic if now_monotonic is not None else time.monotonic()
 
     @property
     def total_bytes(self) -> int:
@@ -97,7 +118,6 @@ class SessionSpool:
                 raise RuntimeError("SessionSpool is closed.")
             start = self._cursor
             self._data_handle.write(pcm_bytes)
-            self._data_handle.flush()
             end = start + len(pcm_bytes)
             self._cursor = end
             record = SpoolRecord(
@@ -108,7 +128,21 @@ class SessionSpool:
             )
             self._records.append(record)
             self._index_handle.write(f"{start}\t{end}\t{sample_rate_hz}\t{channels}\n")
-            self._index_handle.flush()
+            self._bytes_since_flush += len(pcm_bytes)
+            now_monotonic = time.monotonic()
+            if self._flush_interval_seconds == 0.0 and self._flush_bytes == 0:
+                self._flush_pending_handles(now_monotonic=now_monotonic)
+            else:
+                should_flush = False
+                if self._flush_bytes > 0 and self._bytes_since_flush >= self._flush_bytes:
+                    should_flush = True
+                if (
+                    self._flush_interval_seconds > 0.0
+                    and now_monotonic - self._last_flush_monotonic >= self._flush_interval_seconds
+                ):
+                    should_flush = True
+                if should_flush:
+                    self._flush_pending_handles(now_monotonic=now_monotonic)
             return record
 
     def read_range(self, *, start_byte: int, end_byte: int) -> bytes:

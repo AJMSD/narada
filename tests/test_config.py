@@ -33,6 +33,13 @@ def test_default_output_path_is_generated_when_missing() -> None:
     assert config.notes_commit_holdback_windows == 1
     assert config.asr_backlog_warn_seconds == 45.0
     assert config.keep_spool is False
+    assert config.spool_flush_interval_seconds == 0.25
+    assert config.spool_flush_bytes == 65536
+    assert config.writer_fsync_mode == "line"
+    assert config.writer_fsync_lines == 20
+    assert config.writer_fsync_seconds == 1.0
+    assert config.asr_preset == "balanced"
+    assert config.serve_token is None
 
 
 def test_multilingual_requires_explicit_flag() -> None:
@@ -73,6 +80,13 @@ def test_wall_flush_and_queue_warning_threshold_loaded_from_env() -> None:
         "NARADA_NOTES_COMMIT_HOLDBACK_WINDOWS": "2",
         "NARADA_ASR_BACKLOG_WARN_SECONDS": "50.0",
         "NARADA_KEEP_SPOOL": "true",
+        "NARADA_SPOOL_FLUSH_INTERVAL_SECONDS": "0.5",
+        "NARADA_SPOOL_FLUSH_BYTES": "32768",
+        "NARADA_WRITER_FSYNC_MODE": "periodic",
+        "NARADA_WRITER_FSYNC_LINES": "10",
+        "NARADA_WRITER_FSYNC_SECONDS": "2.0",
+        "NARADA_ASR_PRESET": "fast",
+        "NARADA_SERVE_TOKEN": "secret123",
     }
     config = build_runtime_config(ConfigOverrides(), env=env)
     assert config.wall_flush_seconds == 30.0
@@ -82,6 +96,13 @@ def test_wall_flush_and_queue_warning_threshold_loaded_from_env() -> None:
     assert config.notes_commit_holdback_windows == 2
     assert config.asr_backlog_warn_seconds == 50.0
     assert config.keep_spool is True
+    assert config.spool_flush_interval_seconds == 0.5
+    assert config.spool_flush_bytes == 32768
+    assert config.writer_fsync_mode == "periodic"
+    assert config.writer_fsync_lines == 10
+    assert config.writer_fsync_seconds == 2.0
+    assert config.asr_preset == "fast"
+    assert config.serve_token == "secret123"
 
 
 def test_wall_flush_and_queue_warning_threshold_validate_ranges() -> None:
@@ -104,3 +125,20 @@ def test_wall_flush_and_queue_warning_threshold_validate_ranges() -> None:
         build_runtime_config(ConfigOverrides(notes_commit_holdback_windows=-1), env=env)
     with pytest.raises(ConfigError):
         build_runtime_config(ConfigOverrides(asr_backlog_warn_seconds=0.0), env=env)
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(spool_flush_interval_seconds=-0.1), env=env)
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(spool_flush_bytes=-1), env=env)
+    with pytest.raises(ConfigError):
+        build_runtime_config(
+            ConfigOverrides(
+                writer_fsync_mode="periodic",
+                writer_fsync_lines=0,
+                writer_fsync_seconds=0.0,
+            ),
+            env=env,
+        )
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(writer_fsync_mode="bad"), env=env)
+    with pytest.raises(ConfigError):
+        build_runtime_config(ConfigOverrides(asr_preset="ultra"), env=env)

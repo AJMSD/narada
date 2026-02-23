@@ -594,7 +594,12 @@ def _run_tty_notes_first(
             system_thread.start()
             capture_threads.append(system_thread)
 
-        spool = SessionSpool(base_dir=config.out.parent, prefix=f"narada-{config.out.stem}-spool")
+        spool = SessionSpool(
+            base_dir=config.out.parent,
+            prefix=f"narada-{config.out.stem}-spool",
+            flush_interval_seconds=config.spool_flush_interval_seconds,
+            flush_bytes=config.spool_flush_bytes,
+        )
         asr_thread = threading.Thread(
             target=_asr_worker_loop,
             kwargs={
