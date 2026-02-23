@@ -12,12 +12,16 @@ Model = Literal["tiny", "small", "medium", "large"]
 Compute = Literal["cpu", "cuda", "metal", "auto"]
 Engine = Literal["faster-whisper", "whisper-cpp"]
 NoiseSuppress = Literal["off", "rnnoise", "webrtc"]
+WriterFsyncMode = Literal["line", "periodic"]
+AsrPreset = Literal["fast", "balanced", "accurate"]
 
 MODE_VALUES: tuple[Mode, ...] = ("mic", "system", "mixed")
 MODEL_VALUES: tuple[Model, ...] = ("tiny", "small", "medium", "large")
 COMPUTE_VALUES: tuple[Compute, ...] = ("cpu", "cuda", "metal", "auto")
 ENGINE_VALUES: tuple[Engine, ...] = ("faster-whisper", "whisper-cpp")
 NOISE_VALUES: tuple[NoiseSuppress, ...] = ("off", "rnnoise", "webrtc")
+WRITER_FSYNC_MODE_VALUES: tuple[WriterFsyncMode, ...] = ("line", "periodic")
+ASR_PRESET_VALUES: tuple[AsrPreset, ...] = ("fast", "balanced", "accurate")
 
 ENV_KEYS: dict[str, str] = {
     "mode": "NARADA_MODE",
@@ -42,6 +46,13 @@ ENV_KEYS: dict[str, str] = {
     "notes_commit_holdback_windows": "NARADA_NOTES_COMMIT_HOLDBACK_WINDOWS",
     "asr_backlog_warn_seconds": "NARADA_ASR_BACKLOG_WARN_SECONDS",
     "keep_spool": "NARADA_KEEP_SPOOL",
+    "spool_flush_interval_seconds": "NARADA_SPOOL_FLUSH_INTERVAL_SECONDS",
+    "spool_flush_bytes": "NARADA_SPOOL_FLUSH_BYTES",
+    "writer_fsync_mode": "NARADA_WRITER_FSYNC_MODE",
+    "writer_fsync_lines": "NARADA_WRITER_FSYNC_LINES",
+    "writer_fsync_seconds": "NARADA_WRITER_FSYNC_SECONDS",
+    "asr_preset": "NARADA_ASR_PRESET",
+    "serve_token": "NARADA_SERVE_TOKEN",
     "bind": "NARADA_BIND",
     "port": "NARADA_PORT",
     "model_dir_faster_whisper": "NARADA_MODEL_DIR_FASTER_WHISPER",
@@ -97,6 +108,13 @@ class RuntimeConfig:
     notes_commit_holdback_windows: int
     asr_backlog_warn_seconds: float
     keep_spool: bool
+    spool_flush_interval_seconds: float
+    spool_flush_bytes: int
+    writer_fsync_mode: WriterFsyncMode
+    writer_fsync_lines: int
+    writer_fsync_seconds: float
+    asr_preset: AsrPreset
+    serve_token: str | None
     bind: str
     port: int
     model_dir_faster_whisper: Path | None
@@ -127,6 +145,13 @@ class ConfigOverrides:
     notes_commit_holdback_windows: int | None = None
     asr_backlog_warn_seconds: float | None = None
     keep_spool: bool | None = None
+    spool_flush_interval_seconds: float | None = None
+    spool_flush_bytes: int | None = None
+    writer_fsync_mode: str | None = None
+    writer_fsync_lines: int | None = None
+    writer_fsync_seconds: float | None = None
+    asr_preset: str | None = None
+    serve_token: str | None = None
     bind: str | None = None
     port: int | None = None
     model_dir_faster_whisper: Path | None = None
@@ -261,6 +286,25 @@ def _parse_noise(raw_value: str) -> NoiseSuppress:
     return cast(NoiseSuppress, normalized)
 
 
+def _parse_writer_fsync_mode(raw_value: str) -> WriterFsyncMode:
+    normalized = raw_value.strip().lower()
+    if normalized not in WRITER_FSYNC_MODE_VALUES:
+        raise ConfigError(
+            f"Invalid writer fsync mode '{raw_value}'. "
+            f"Expected one of: {', '.join(WRITER_FSYNC_MODE_VALUES)}."
+        )
+    return cast(WriterFsyncMode, normalized)
+
+
+def _parse_asr_preset(raw_value: str) -> AsrPreset:
+    normalized = raw_value.strip().lower()
+    if normalized not in ASR_PRESET_VALUES:
+        raise ConfigError(
+            f"Invalid ASR preset '{raw_value}'. Expected one of: {', '.join(ASR_PRESET_VALUES)}."
+        )
+    return cast(AsrPreset, normalized)
+
+
 def build_runtime_config(
     overrides: ConfigOverrides,
     env: Mapping[str, str] | None = None,
@@ -357,6 +401,47 @@ def build_runtime_config(
         env_values.get("keep_spool"),
         "false",
     )
+    spool_flush_interval_seconds_raw = _choose_string(
+        (
+            str(overrides.spool_flush_interval_seconds)
+            if overrides.spool_flush_interval_seconds is not None
+            else None
+        ),
+        env_values.get("spool_flush_interval_seconds"),
+        "0.25",
+    )
+    spool_flush_bytes_raw = _choose_string(
+        str(overrides.spool_flush_bytes) if overrides.spool_flush_bytes is not None else None,
+        env_values.get("spool_flush_bytes"),
+        "65536",
+    )
+    writer_fsync_mode_raw = _choose_string(
+        overrides.writer_fsync_mode,
+        env_values.get("writer_fsync_mode"),
+        "line",
+    )
+    writer_fsync_lines_raw = _choose_string(
+        str(overrides.writer_fsync_lines) if overrides.writer_fsync_lines is not None else None,
+        env_values.get("writer_fsync_lines"),
+        "20",
+    )
+    writer_fsync_seconds_raw = _choose_string(
+        (
+            str(overrides.writer_fsync_seconds)
+            if overrides.writer_fsync_seconds is not None
+            else None
+        ),
+        env_values.get("writer_fsync_seconds"),
+        "1.0",
+    )
+    asr_preset_raw = _choose_string(
+        overrides.asr_preset,
+        env_values.get("asr_preset"),
+        "balanced",
+    )
+    serve_token = _choose_string(overrides.serve_token, env_values.get("serve_token"), "").strip()
+    if not serve_token:
+        serve_token = None
     bind = _choose_string(overrides.bind, env_values.get("bind"), "0.0.0.0")
     port_raw = _choose_string(
         str(overrides.port) if overrides.port is not None else None,
@@ -404,6 +489,28 @@ def build_runtime_config(
             f"Invalid ASR backlog warning threshold: '{asr_backlog_warn_seconds_raw}'."
         ) from exc
     keep_spool = _parse_bool(keep_spool_raw, "keep_spool")
+    try:
+        spool_flush_interval_seconds = float(spool_flush_interval_seconds_raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"Invalid spool flush interval: '{spool_flush_interval_seconds_raw}'."
+        ) from exc
+    try:
+        spool_flush_bytes = int(spool_flush_bytes_raw)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid spool flush byte threshold: '{spool_flush_bytes_raw}'.") from exc
+    writer_fsync_mode = _parse_writer_fsync_mode(writer_fsync_mode_raw)
+    try:
+        writer_fsync_lines = int(writer_fsync_lines_raw)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid writer fsync line threshold: '{writer_fsync_lines_raw}'.") from exc
+    try:
+        writer_fsync_seconds = float(writer_fsync_seconds_raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"Invalid writer fsync interval: '{writer_fsync_seconds_raw}'."
+        ) from exc
+    asr_preset = _parse_asr_preset(asr_preset_raw)
 
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ConfigError("Confidence threshold must be between 0.0 and 1.0.")
@@ -421,6 +528,19 @@ def build_runtime_config(
         raise ConfigError("Notes commit holdback windows must be >= 0.")
     if asr_backlog_warn_seconds <= 0.0:
         raise ConfigError("ASR backlog warning threshold must be > 0.0.")
+    if spool_flush_interval_seconds < 0.0:
+        raise ConfigError("Spool flush interval seconds must be >= 0.0.")
+    if spool_flush_bytes < 0:
+        raise ConfigError("Spool flush bytes must be >= 0.")
+    if writer_fsync_lines < 0:
+        raise ConfigError("Writer fsync line threshold must be >= 0.")
+    if writer_fsync_seconds < 0.0:
+        raise ConfigError("Writer fsync interval seconds must be >= 0.0.")
+    if writer_fsync_mode == "periodic" and writer_fsync_lines == 0 and writer_fsync_seconds == 0.0:
+        raise ConfigError(
+            "Writer fsync periodic mode requires writer_fsync_lines > 0 or "
+            "writer_fsync_seconds > 0."
+        )
 
     try:
         port = int(port_raw)
@@ -467,6 +587,13 @@ def build_runtime_config(
         notes_commit_holdback_windows=notes_commit_holdback_windows,
         asr_backlog_warn_seconds=asr_backlog_warn_seconds,
         keep_spool=keep_spool,
+        spool_flush_interval_seconds=spool_flush_interval_seconds,
+        spool_flush_bytes=spool_flush_bytes,
+        writer_fsync_mode=writer_fsync_mode,
+        writer_fsync_lines=writer_fsync_lines,
+        writer_fsync_seconds=writer_fsync_seconds,
+        asr_preset=asr_preset,
+        serve_token=serve_token,
         bind=bind,
         port=port,
         model_dir_faster_whisper=model_dir_faster_whisper,

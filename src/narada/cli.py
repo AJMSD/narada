@@ -1030,6 +1030,36 @@ def start_command(
         "--keep-spool/--no-keep-spool",
         help="Keep raw spool files for post-run debugging/recovery.",
     ),
+    spool_flush_interval_seconds: float | None = typer.Option(
+        None,
+        "--spool-flush-interval-seconds",
+        help="Flush live spool files at this interval (seconds). Use 0 to disable interval trigger.",
+    ),
+    spool_flush_bytes: int | None = typer.Option(
+        None,
+        "--spool-flush-bytes",
+        help="Flush live spool files when pending bytes reach this threshold. Use 0 to disable.",
+    ),
+    writer_fsync_mode: str | None = typer.Option(
+        None,
+        "--writer-fsync-mode",
+        help="line|periodic transcript fsync policy.",
+    ),
+    writer_fsync_lines: int | None = typer.Option(
+        None,
+        "--writer-fsync-lines",
+        help="In periodic fsync mode, fsync after this many committed lines (0 disables).",
+    ),
+    writer_fsync_seconds: float | None = typer.Option(
+        None,
+        "--writer-fsync-seconds",
+        help="In periodic fsync mode, fsync after this many seconds (0 disables).",
+    ),
+    asr_preset: str | None = typer.Option(
+        None,
+        "--asr-preset",
+        help="fast|balanced|accurate decode preset.",
+    ),
     serve: bool = typer.Option(
         False,
         "--serve",
@@ -1049,6 +1079,11 @@ def start_command(
         False,
         "--qr",
         help="Print an ASCII QR code when --serve is enabled.",
+    ),
+    serve_token: str | None = typer.Option(
+        None,
+        "--serve-token",
+        help="Optional auth token required by transcript HTTP endpoints.",
     ),
     model_dir_faster_whisper: Path | None = typer.Option(
         None,
@@ -1089,6 +1124,13 @@ def start_command(
         notes_commit_holdback_windows=notes_commit_holdback_windows,
         asr_backlog_warn_seconds=asr_backlog_warn_seconds,
         keep_spool=keep_spool,
+        spool_flush_interval_seconds=spool_flush_interval_seconds,
+        spool_flush_bytes=spool_flush_bytes,
+        writer_fsync_mode=writer_fsync_mode,
+        writer_fsync_lines=writer_fsync_lines,
+        writer_fsync_seconds=writer_fsync_seconds,
+        asr_preset=asr_preset,
+        serve_token=serve_token,
         bind=bind,
         port=port,
         model_dir_faster_whisper=model_dir_faster_whisper,
@@ -1500,6 +1542,11 @@ def serve_command(
     port: int | None = typer.Option(None, "--port", help="HTTP port."),
     qr: bool = typer.Option(False, "--qr", help="Print an ASCII QR code."),
     bind: str | None = typer.Option(None, "--bind", help="Bind address."),
+    serve_token: str | None = typer.Option(
+        None,
+        "--serve-token",
+        help="Optional auth token required by transcript HTTP endpoints.",
+    ),
 ) -> None:
     transcript_file = file
     if transcript_file is None:
