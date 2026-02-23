@@ -17,6 +17,7 @@ class TranscriptionRequest:
     languages: tuple[str, ...]
     model: str
     compute: str
+    asr_preset: str = "balanced"
 
 
 @dataclass(frozen=True)

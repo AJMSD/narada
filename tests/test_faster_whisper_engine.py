@@ -40,7 +40,8 @@ class _FakeModel:
         assert audio.dtype == np.float32
         self.audio_inputs.append(audio)
         self.calls.append(dict(kwargs))
-        if kwargs.get("beam_size") == 1:
+        # Treat the first beam_size=1 invocation as warmup.
+        if kwargs.get("beam_size") == 1 and len(self.calls) == 1:
             return ([], {})
         return ([_FakeSegment("hello world")], {})
 
@@ -267,6 +268,85 @@ def test_faster_whisper_gpu_materialization_error_falls_back_to_cpu() -> None:
     engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
     assert result[0].text == "hello world"
     assert engine._gpu_disabled_reason is not None
+
+
+def test_faster_whisper_fast_preset_uses_fast_decode_in_process() -> None:
+    FasterWhisperEngine.clear_cache_for_tests()
+    fake_model = _FakeModel(model_sample_rate_hz=16000)
+    engine = FasterWhisperEngine(
+        model_factory=lambda *_args: fake_model,
+        availability_probe=lambda: True,
+    )
+    request = TranscriptionRequest(
+        pcm_bytes=b"\x00\x00\x10\x00",
+        sample_rate_hz=16000,
+        languages=("en",),
+        model="small",
+        compute="cpu",
+        asr_preset="fast",
+    )
+
+    result = engine.transcribe(request)
+
+    assert result[0].text == "hello world"
+    main_call = fake_model.calls[-1]
+    assert main_call["beam_size"] == 1
+    assert main_call["vad_filter"] is False
+    assert main_call["condition_on_previous_text"] is False
+
+
+def test_faster_whisper_accurate_preset_enables_condition_on_previous_text() -> None:
+    FasterWhisperEngine.clear_cache_for_tests()
+    fake_model = _FakeModel(model_sample_rate_hz=16000)
+    engine = FasterWhisperEngine(
+        model_factory=lambda *_args: fake_model,
+        availability_probe=lambda: True,
+    )
+    request = TranscriptionRequest(
+        pcm_bytes=b"\x00\x00\x10\x00",
+        sample_rate_hz=16000,
+        languages=("en",),
+        model="small",
+        compute="cpu",
+        asr_preset="accurate",
+    )
+
+    result = engine.transcribe(request)
+
+    assert result[0].text == "hello world"
+    main_call = fake_model.calls[-1]
+    assert main_call["beam_size"] == 5
+    assert main_call["vad_filter"] is True
+    assert main_call["condition_on_previous_text"] is True
+
+
+def test_faster_whisper_passes_asr_preset_to_gpu_path() -> None:
+    engine = FasterWhisperEngine(
+        model_factory=lambda *_args: _FakeModel(),
+        availability_probe=lambda: True,
+    )
+    seen: dict[str, object] = {}
+
+    def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
+        seen.update(kwargs)
+        return [{"text": "gpu result", "start_s": 0.0, "end_s": 1.0, "confidence": 0.9}]
+
+    original_guarded = engine._transcribe_gpu_guarded
+    engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
+    request = TranscriptionRequest(
+        pcm_bytes=b"\x00\x00\x10\x00",
+        sample_rate_hz=16000,
+        languages=("en",),
+        model="small",
+        compute="auto",
+        asr_preset="accurate",
+    )
+
+    result = engine.transcribe(request)
+    engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
+
+    assert result[0].text == "gpu result"
+    assert seen["asr_preset"] == "accurate"
 
 
 def test_faster_whisper_compute_metal_invalid_on_non_macos() -> None:

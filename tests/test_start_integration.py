@@ -98,9 +98,11 @@ class _RecordingSampleRateEngine(_FakeEngine):
     def __init__(self, text: str) -> None:
         super().__init__(text=text)
         self.sample_rates: list[int] = []
+        self.asr_presets: list[str] = []
 
     def transcribe(self, request: TranscriptionRequest) -> list[TranscriptSegment]:
         self.sample_rates.append(request.sample_rate_hz)
+        self.asr_presets.append(request.asr_preset)
         return super().transcribe(request)
 
 
@@ -684,6 +686,8 @@ def test_start_preserves_live_frame_sample_rate_in_transcription_request(
 
     assert recording_engine.sample_rates
     assert recording_engine.sample_rates[0] == 48000
+    assert recording_engine.asr_presets
+    assert recording_engine.asr_presets[0] == "balanced"
     assert "sample rate transcript" in out_path.read_text(encoding="utf-8")
 
 

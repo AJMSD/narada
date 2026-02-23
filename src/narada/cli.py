@@ -214,6 +214,7 @@ def _transcribe_windows(
             languages=config.languages,
             model=config.model,
             compute=config.compute,
+            asr_preset=config.asr_preset,
         )
         started = time.perf_counter()
         result = engine_instance.transcribe(request)
@@ -391,6 +392,7 @@ def _asr_worker_loop(
                 languages=config.languages,
                 model=config.model,
                 compute=config.compute,
+                asr_preset=config.asr_preset,
             )
             segments = tuple(engine_instance.transcribe(request))
             result_queue.put(

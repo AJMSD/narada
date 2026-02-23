@@ -48,6 +48,27 @@ class _GpuWorkerHandle:
     next_request_id: int = 1
 
 
+@dataclass(frozen=True)
+class _DecodePreset:
+    beam_size: int
+    vad_filter: bool
+    condition_on_previous_text: bool
+
+
+_DECODE_PRESETS: dict[str, _DecodePreset] = {
+    "fast": _DecodePreset(beam_size=1, vad_filter=False, condition_on_previous_text=False),
+    "balanced": _DecodePreset(beam_size=5, vad_filter=True, condition_on_previous_text=False),
+    "accurate": _DecodePreset(beam_size=5, vad_filter=True, condition_on_previous_text=True),
+}
+
+
+def _resolve_decode_preset(asr_preset: str | None) -> _DecodePreset:
+    if asr_preset is None:
+        return _DECODE_PRESETS["balanced"]
+    normalized = asr_preset.strip().lower()
+    return _DECODE_PRESETS.get(normalized, _DECODE_PRESETS["balanced"])
+
+
 def _maybe_float(value: Any) -> float | None:
     if isinstance(value, (float, int)):
         return float(value)
@@ -173,6 +194,7 @@ def _gpu_transcribe_worker_main(
         probe = bool(request.get("probe", False))
         language = request.get("language")
         multilingual = bool(request.get("multilingual", False))
+        asr_preset = request.get("asr_preset")
         audio = np.frombuffer(bytes(request.get("audio", b"")), dtype=np.float32).copy()
 
         try:
@@ -191,14 +213,17 @@ def _gpu_transcribe_worker_main(
                 response_queue.put({"kind": "result", "id": request_id, "segments": []})
                 continue
 
+            decode_preset = _resolve_decode_preset(
+                asr_preset if isinstance(asr_preset, str) else None
+            )
             segments_iter = _call_model_transcribe(
                 model=model,
                 audio=audio,
                 language=language if isinstance(language, str) else None,
                 multilingual=multilingual,
-                beam_size=5,
-                vad_filter=True,
-                condition_on_previous_text=False,
+                beam_size=decode_preset.beam_size,
+                vad_filter=decode_preset.vad_filter,
+                condition_on_previous_text=decode_preset.condition_on_previous_text,
             )
             parsed_payload: list[dict[str, Any]] = []
             for segment in segments_iter:
@@ -286,6 +311,7 @@ class FasterWhisperEngine:
                 source_rate_hz=request.sample_rate_hz,
                 language=language,
                 multilingual=multilingual,
+                asr_preset=request.asr_preset,
             )
             if guarded is not None:
                 return guarded
@@ -300,6 +326,7 @@ class FasterWhisperEngine:
             source_rate_hz=request.sample_rate_hz,
             language=language,
             multilingual=multilingual,
+            asr_preset=request.asr_preset,
         )
 
     def _transcribe_with_gpu_guard(
@@ -313,6 +340,7 @@ class FasterWhisperEngine:
         source_rate_hz: int,
         language: str | None,
         multilingual: bool,
+        asr_preset: str,
     ) -> list[TranscriptSegment] | None:
         if self._gpu_disabled_reason is not None:
             return None
@@ -326,6 +354,7 @@ class FasterWhisperEngine:
                 source_rate_hz=source_rate_hz,
                 language=language,
                 multilingual=multilingual,
+                asr_preset=asr_preset,
             )
             return self._segments_from_worker_payload(payload)
         except _GpuWorkerError as exc:
@@ -360,6 +389,7 @@ class FasterWhisperEngine:
         source_rate_hz: int,
         language: str | None,
         multilingual: bool,
+        asr_preset: str,
     ) -> list[dict[str, Any]]:
         worker = self._ensure_gpu_worker((model_reference, device, compute_type))
 
@@ -371,6 +401,7 @@ class FasterWhisperEngine:
                 audio=probe_audio,
                 language="en",
                 multilingual=False,
+                asr_preset="fast",
                 timeout_s=self._GPU_PROBE_TIMEOUT_S,
                 probe=True,
             )
@@ -386,6 +417,7 @@ class FasterWhisperEngine:
             audio=worker_audio,
             language=language,
             multilingual=multilingual,
+            asr_preset=asr_preset,
             timeout_s=self._GPU_TRANSCRIBE_TIMEOUT_S,
             probe=False,
         )
@@ -454,6 +486,7 @@ class FasterWhisperEngine:
         audio: np.ndarray[Any, np.dtype[np.float32]],
         language: str | None,
         multilingual: bool,
+        asr_preset: str,
         timeout_s: float,
         probe: bool,
     ) -> list[dict[str, Any]]:
@@ -465,6 +498,7 @@ class FasterWhisperEngine:
             "audio": audio.astype(np.float32, copy=False).tobytes(),
             "language": language,
             "multilingual": multilingual,
+            "asr_preset": asr_preset,
             "probe": probe,
         }
         try:
@@ -570,6 +604,7 @@ class FasterWhisperEngine:
         source_rate_hz: int,
         language: str | None,
         multilingual: bool,
+        asr_preset: str,
     ) -> list[TranscriptSegment]:
         cache_key = (model_reference, device, compute_type)
         model = self._load_model(
@@ -591,6 +626,7 @@ class FasterWhisperEngine:
                 audio=audio,
                 language=language,
                 multilingual=multilingual,
+                asr_preset=asr_preset,
             )
             return self._parse_segments(segments_iter)
         except Exception as exc:
@@ -711,15 +747,17 @@ class FasterWhisperEngine:
         audio: np.ndarray[Any, np.dtype[np.float32]],
         language: str | None,
         multilingual: bool,
+        asr_preset: str,
     ) -> Sequence[Any]:
+        decode_preset = _resolve_decode_preset(asr_preset)
         return _call_model_transcribe(
             model=model,
             audio=audio,
             language=language,
             multilingual=multilingual,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
+            beam_size=decode_preset.beam_size,
+            vad_filter=decode_preset.vad_filter,
+            condition_on_previous_text=decode_preset.condition_on_previous_text,
         )
 
     @staticmethod
