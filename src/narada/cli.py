@@ -1214,7 +1214,12 @@ def start_command(
             if qr:
                 typer.echo(render_ascii_qr(running_server.access_url))
 
-        with TranscriptWriter(config.out) as writer:
+        with TranscriptWriter(
+            config.out,
+            fsync_mode=config.writer_fsync_mode,
+            fsync_lines=config.writer_fsync_lines,
+            fsync_seconds=config.writer_fsync_seconds,
+        ) as writer:
             if sys.stdin.isatty():
                 stopped_by_user = _run_tty_notes_first(
                     config=config,
