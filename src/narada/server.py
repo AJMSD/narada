@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 INDEX_HTML = """<!doctype html>
 <html>
@@ -35,13 +35,13 @@ INDEX_HTML = """<!doctype html>
 <body>
   <h1>Narada Live Transcript</h1>
   <p>
-    Streaming updates from <code>/events</code>.
-    Raw transcript: <a href="/transcript.txt">/transcript.txt</a>
+    Streaming updates from <code>__EVENTS_URL__</code>.
+    Raw transcript: <a href="__TRANSCRIPT_URL__">__TRANSCRIPT_URL__</a>
   </p>
   <div id="log"></div>
   <script>
     const log = document.getElementById("log");
-    const source = new EventSource("/events");
+    const source = new EventSource("__EVENTS_URL__");
     let lastRenderedEventId = -1;
     source.onmessage = (event) => {
       const parsedEventId = Number.parseInt(event.lastEventId || "", 10);
@@ -63,6 +63,7 @@ INDEX_HTML = """<!doctype html>
 class TranscriptHTTPServer(ThreadingHTTPServer):
     transcript_path: Path
     stop_event: threading.Event
+    serve_token: str | None
 
     def __init__(
         self,
@@ -70,31 +71,67 @@ class TranscriptHTTPServer(ThreadingHTTPServer):
         request_handler: type[BaseHTTPRequestHandler],
         transcript_path: Path,
         stop_event: threading.Event,
+        serve_token: str | None,
     ) -> None:
         super().__init__(server_address, request_handler)
         self.transcript_path = transcript_path
         self.stop_event = stop_event
+        self.serve_token = serve_token
 
 
 class TranscriptHandler(BaseHTTPRequestHandler):
     server: TranscriptHTTPServer
 
+    def _is_authorized(self, parsed_path: object) -> bool:
+        token = self.server.serve_token
+        if token is None:
+            return True
+        query = parse_qs(getattr(parsed_path, "query", ""), keep_blank_values=True)
+        provided = query.get("token")
+        return bool(provided and provided[0] == token)
+
+    def _reject_unauthorized(self) -> None:
+        payload = b"Unauthorized"
+        self.send_response(401)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/":
+            if not self._is_authorized(parsed):
+                self._reject_unauthorized()
+                return
             self._serve_index()
             return
         if parsed.path == "/transcript.txt":
+            if not self._is_authorized(parsed):
+                self._reject_unauthorized()
+                return
             self._serve_transcript()
             return
         if parsed.path == "/events":
+            if not self._is_authorized(parsed):
+                self._reject_unauthorized()
+                return
             self._serve_events()
             return
         self.send_response(404)
         self.end_headers()
 
     def _serve_index(self) -> None:
-        payload = INDEX_HTML.encode("utf-8")
+        token_suffix = ""
+        if self.server.serve_token is not None:
+            token_suffix = f"?token={quote(self.server.serve_token, safe='')}"
+        events_url = f"/events{token_suffix}"
+        transcript_url = f"/transcript.txt{token_suffix}"
+        payload = (
+            INDEX_HTML.replace("__EVENTS_URL__", events_url).replace(
+                "__TRANSCRIPT_URL__", transcript_url
+            )
+        ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
@@ -170,11 +207,14 @@ def resolve_lan_ip() -> str:
         sock.close()
 
 
-def build_access_url(bind: str, port: int) -> str:
+def build_access_url(bind: str, port: int, serve_token: str | None = None) -> str:
     host = bind
     if bind in {"0.0.0.0", "::"}:
         host = resolve_lan_ip()
-    return f"http://{host}:{port}"
+    base = f"http://{host}:{port}"
+    if serve_token is None:
+        return base
+    return f"{base}?token={quote(serve_token, safe='')}"
 
 
 def render_ascii_qr(url: str) -> str:
@@ -212,10 +252,17 @@ def start_transcript_server(
     transcript_path: Path,
     bind: str,
     port: int,
+    serve_token: str | None = None,
 ) -> RunningTranscriptServer:
     stop_event = threading.Event()
-    server = TranscriptHTTPServer((bind, port), TranscriptHandler, transcript_path, stop_event)
-    access_url = build_access_url(bind, int(server.server_address[1]))
+    server = TranscriptHTTPServer(
+        (bind, port),
+        TranscriptHandler,
+        transcript_path,
+        stop_event,
+        serve_token,
+    )
+    access_url = build_access_url(bind, int(server.server_address[1]), serve_token)
     thread = threading.Thread(
         target=server.serve_forever,
         kwargs={"poll_interval": 0.5},
@@ -235,12 +282,20 @@ def serve_transcript_file(
     bind: str,
     port: int,
     show_qr: bool,
+    serve_token: str | None = None,
 ) -> None:
-    running_server = start_transcript_server(transcript_path, bind, port)
+    running_server = start_transcript_server(
+        transcript_path,
+        bind,
+        port,
+        serve_token=serve_token,
+    )
     print(f"Serving transcript from {transcript_path}")
     print(f"URL: {running_server.access_url}")
     if bind == "0.0.0.0":
         print("Warning: server bound to all interfaces on local network.")
+        if serve_token is None:
+            print("Warning: LAN server is unauthenticated. Set --serve-token to require access.")
     if show_qr:
         print(render_ascii_qr(running_server.access_url))
 

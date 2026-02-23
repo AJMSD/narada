@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import http.client
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
+
+import pytest
 
 from narada.server import TranscriptHandler, TranscriptHTTPServer, start_transcript_server
 
 
-def _start_server(transcript_path: Path) -> tuple[TranscriptHTTPServer, threading.Thread]:
+def _start_server(
+    transcript_path: Path, *, serve_token: str | None = None
+) -> tuple[TranscriptHTTPServer, threading.Thread]:
     stop_event = threading.Event()
-    server = TranscriptHTTPServer(("127.0.0.1", 0), TranscriptHandler, transcript_path, stop_event)
+    server = TranscriptHTTPServer(
+        ("127.0.0.1", 0),
+        TranscriptHandler,
+        transcript_path,
+        stop_event,
+        serve_token,
+    )
     thread = threading.Thread(
         target=server.serve_forever,
         kwargs={"poll_interval": 0.1},
@@ -144,6 +155,71 @@ def test_start_transcript_server_helper_starts_and_stops(tmp_path: Path) -> None
     try:
         assert running.access_url.startswith("http://127.0.0.1:")
         with urllib.request.urlopen(f"{running.access_url}/transcript.txt", timeout=5) as response:
+            body = response.read().decode("utf-8")
+        assert "line-one" in body
+    finally:
+        running.stop()
+
+
+def test_token_auth_rejects_requests_without_token(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.txt"
+    transcript_path.write_text("line-one\n", encoding="utf-8")
+    server, thread = _start_server(transcript_path, serve_token="secret-token")
+    port = server.server_address[1]
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/transcript.txt", timeout=5)
+        assert exc_info.value.code == 401
+
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/transcript.txt?token=secret-token",
+            timeout=5,
+        ) as response:
+            body = response.read().decode("utf-8")
+        assert "line-one" in body
+    finally:
+        server.stop_event.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_token_auth_index_includes_tokenized_endpoints(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.txt"
+    transcript_path.write_text("line-one\n", encoding="utf-8")
+    server, thread = _start_server(transcript_path, serve_token="abc123")
+    port = server.server_address[1]
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=abc123",
+            timeout=5,
+        ) as response:
+            html = response.read().decode("utf-8")
+        assert "/events?token=abc123" in html
+        assert "/transcript.txt?token=abc123" in html
+    finally:
+        server.stop_event.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_start_transcript_server_helper_includes_token_in_access_url(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.txt"
+    transcript_path.write_text("line-one\n", encoding="utf-8")
+    running = start_transcript_server(
+        transcript_path=transcript_path,
+        bind="127.0.0.1",
+        port=0,
+        serve_token="secret-token",
+    )
+    try:
+        assert "?token=secret-token" in running.access_url
+        port = running.server.server_address[1]
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/transcript.txt?token=secret-token",
+            timeout=5,
+        ) as response:
             body = response.read().decode("utf-8")
         assert "line-one" in body
     finally:

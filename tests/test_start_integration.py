@@ -186,6 +186,7 @@ def _run_start_for_tests(**kwargs: Any) -> None:
         "bind": None,
         "port": None,
         "qr": False,
+        "serve_token": None,
     }
     defaults.update(kwargs)
     start_command(**defaults)
@@ -499,10 +500,13 @@ def test_start_with_serve_launches_and_stops_server(monkeypatch: Any, tmp_path: 
     monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
     monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls())
 
-    def _start_server(transcript_path: Path, bind: str, port: int) -> _FakeRunningServer:
+    def _start_server(
+        transcript_path: Path, bind: str, port: int, serve_token: str | None = None
+    ) -> _FakeRunningServer:
         calls["transcript_path"] = transcript_path
         calls["bind"] = bind
         calls["port"] = port
+        calls["serve_token"] = serve_token
         return fake_server
 
     monkeypatch.setattr("narada.cli.start_transcript_server", _start_server)
@@ -512,6 +516,55 @@ def test_start_with_serve_launches_and_stops_server(monkeypatch: Any, tmp_path: 
     assert calls["transcript_path"] == out_path
     assert calls["bind"] == cfg.bind
     assert calls["port"] == cfg.port
+    assert calls["serve_token"] is None
+    assert fake_server.stopped
+
+
+def test_start_with_serve_passes_serve_token(monkeypatch: Any, tmp_path: Path) -> None:
+    out_path = tmp_path / "served-token.txt"
+    cfg = _runtime_config("mic", out_path)
+    cfg = RuntimeConfig(**{**cfg.__dict__, "serve_token": "topsecret"})
+    fake_engine = _FakeEngine("served transcript")
+    mic_capture = _FakeCapture(frames=[_frame()])
+    fake_server = _FakeRunningServer()
+    calls: dict[str, Any] = {}
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls())
+
+    def _start_server(
+        transcript_path: Path, bind: str, port: int, serve_token: str | None = None
+    ) -> _FakeRunningServer:
+        calls["transcript_path"] = transcript_path
+        calls["bind"] = bind
+        calls["port"] = port
+        calls["serve_token"] = serve_token
+        return fake_server
+
+    monkeypatch.setattr("narada.cli.start_transcript_server", _start_server)
+
+    _run_start_for_tests(serve=True, serve_token="topsecret")
+    assert calls["transcript_path"] == out_path
+    assert calls["bind"] == cfg.bind
+    assert calls["port"] == cfg.port
+    assert calls["serve_token"] == "topsecret"
     assert fake_server.stopped
 
 
@@ -805,4 +858,11 @@ def test_start_rejects_serve_options_without_serve() -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["start", "--bind", "127.0.0.1"])
     assert result.exit_code != 0
-    assert "require `--serve`" in result.output.lower()
+    normalized = result.output.lower()
+    assert "require" in normalized
+    assert "--serve" in normalized
+    token_result = runner.invoke(app, ["start", "--serve-token", "abc"])
+    assert token_result.exit_code != 0
+    token_normalized = token_result.output.lower()
+    assert "require" in token_normalized
+    assert "--serve" in token_normalized

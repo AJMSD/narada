@@ -1103,9 +1103,9 @@ def start_command(
         help="Optional local model directory override for whisper.cpp.",
     ),
 ) -> None:
-    if not serve and (bind is not None or port is not None or qr):
+    if not serve and (bind is not None or port is not None or qr or serve_token is not None):
         raise typer.BadParameter(
-            "`--bind`, `--port`, and `--qr` require `--serve` with `narada start`."
+            "`--bind`, `--port`, `--qr`, and `--serve-token` require `--serve` with `narada start`."
         )
 
     overrides = ConfigOverrides(
@@ -1204,7 +1204,12 @@ def start_command(
     try:
         if serve:
             try:
-                running_server = start_transcript_server(config.out, config.bind, config.port)
+                running_server = start_transcript_server(
+                    config.out,
+                    config.bind,
+                    config.port,
+                    serve_token=config.serve_token,
+                )
             except OSError as exc:
                 raise typer.BadParameter(
                     f"Unable to start server on {config.bind}:{config.port}: {exc}"
@@ -1213,6 +1218,10 @@ def start_command(
             typer.echo(f"URL: {running_server.access_url}")
             if config.bind == "0.0.0.0":
                 typer.echo("Warning: server bound to all interfaces on local network.")
+                if config.serve_token is None:
+                    typer.echo(
+                        "Warning: LAN server is unauthenticated. Set --serve-token to require access."
+                    )
             if qr:
                 typer.echo(render_ascii_qr(running_server.access_url))
 
@@ -1568,6 +1577,7 @@ def serve_command(
         bind=bind or os.environ.get("NARADA_BIND", "0.0.0.0"),
         port=port or int(os.environ.get("NARADA_PORT", "8787")),
         show_qr=qr,
+        serve_token=serve_token or os.environ.get("NARADA_SERVE_TOKEN"),
     )
 
 
