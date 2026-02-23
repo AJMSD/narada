@@ -439,7 +439,11 @@ def build_runtime_config(
         env_values.get("asr_preset"),
         "balanced",
     )
-    serve_token = _choose_string(overrides.serve_token, env_values.get("serve_token"), "").strip()
+    serve_token: str | None = _choose_string(
+        overrides.serve_token,
+        env_values.get("serve_token"),
+        "",
+    ).strip()
     if not serve_token:
         serve_token = None
     bind = _choose_string(overrides.bind, env_values.get("bind"), "0.0.0.0")

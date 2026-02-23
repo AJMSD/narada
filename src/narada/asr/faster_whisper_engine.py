@@ -9,9 +9,10 @@ import queue
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib.util import find_spec
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from threading import Lock
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import numpy as np
 
@@ -41,7 +42,7 @@ class _GpuWorkerExitError(_GpuWorkerError):
 @dataclass
 class _GpuWorkerHandle:
     key: tuple[str, str, str]
-    process: mp.Process
+    process: BaseProcess
     request_queue: Any
     response_queue: Any
     sample_rate_hz: int
@@ -90,6 +91,8 @@ def _confidence_from_scores(
 def _resolve_model_sample_rate_hz(model: Any) -> int:
     feature_extractor = getattr(model, "feature_extractor", None)
     sampling_rate = getattr(feature_extractor, "sampling_rate", None)
+    if sampling_rate is None:
+        return 16000
     try:
         value = int(sampling_rate)
     except (TypeError, ValueError):
@@ -128,7 +131,7 @@ def _resample_audio_if_needed(
         source_positions,
         audio.astype(np.float64, copy=False),
     )
-    return resampled.astype(np.float32, copy=False)
+    return cast(np.ndarray[Any, np.dtype[np.float32]], resampled.astype(np.float32, copy=False))
 
 
 def _call_model_transcribe(
@@ -156,7 +159,7 @@ def _call_model_transcribe(
             language=language,
             beam_size=beam_size,
         )
-    return segments_iter
+    return cast(Sequence[Any], segments_iter)
 
 
 def _gpu_transcribe_worker_main(
@@ -553,7 +556,7 @@ class FasterWhisperEngine:
 
     @staticmethod
     def _terminate_worker_process(
-        process: mp.Process,
+        process: BaseProcess,
         request_queue: Any,
         response_queue: Any,
     ) -> None:
