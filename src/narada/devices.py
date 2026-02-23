@@ -340,9 +340,7 @@ def _dedupe_endpoints(
     os_name: str,
 ) -> list[AudioDevice]:
     eligible_devices = [
-        device
-        for device in devices
-        if not _is_excluded_hostapi(device, os_name=os_name)
+        device for device in devices if not _is_excluded_hostapi(device, os_name=os_name)
     ]
     deduped_by_key: dict[tuple[str, DeviceType], AudioDevice] = {}
 

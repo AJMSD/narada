@@ -399,9 +399,7 @@ def open_windows_system_stream(
             )
 
         loopbacks = [dict(item) for item in audio.get_loopback_device_info_generator()]
-        loopback_candidates = [
-            item for item in loopbacks if _is_wasapi_device(item, hostapi_names)
-        ]
+        loopback_candidates = [item for item in loopbacks if _is_wasapi_device(item, hostapi_names)]
         if not loopback_candidates:
             _raise_capture_error(
                 "No WASAPI loopback sources detected. Ensure a playback device is enabled "
@@ -419,9 +417,7 @@ def open_windows_system_stream(
                 f"Loopback source for '{output_device_name}' has an invalid device index."
             )
 
-        default_sample_rate_hz = _safe_int(
-            loopback_device.get("defaultSampleRate"), sample_rate_hz
-        )
+        default_sample_rate_hz = _safe_int(loopback_device.get("defaultSampleRate"), sample_rate_hz)
         max_loopback_channels = _safe_int(loopback_device.get("maxInputChannels"), 2)
         channel_candidates = _candidate_values(max_loopback_channels, 2, 1)
         stream, opened_rate_hz, opened_channels = _open_stream_with_fallback(

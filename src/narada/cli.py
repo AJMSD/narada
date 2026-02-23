@@ -76,9 +76,7 @@ class _LiveStatusRenderer:
         self._stream = stream if hasattr(stream, "write") else None
         self._line_count = 0
         self._supports_ansi = bool(
-            self._stream is not None
-            and hasattr(self._stream, "isatty")
-            and self._stream.isatty()
+            self._stream is not None and hasattr(self._stream, "isatty") and self._stream.isatty()
         )
 
     def render(self, lines: list[str]) -> None:
@@ -1041,8 +1039,7 @@ def start_command(
         None,
         "--spool-flush-interval-seconds",
         help=(
-            "Flush live spool files at this interval (seconds). "
-            "Use 0 to disable interval trigger."
+            "Flush live spool files at this interval (seconds). Use 0 to disable interval trigger."
         ),
     ),
     spool_flush_bytes: int | None = typer.Option(
