@@ -261,6 +261,7 @@ class FasterWhisperEngine:
     _model_cache: ClassVar[dict[tuple[str, str, str], Any]] = {}
     _warmed_models: ClassVar[set[tuple[str, str, str]]] = set()
     _cache_lock: ClassVar[Lock] = Lock()
+    _GPU_STARTUP_TIMEOUT_S: ClassVar[float] = 20.0
     _GPU_PROBE_TIMEOUT_S: ClassVar[float] = 4.0
     _GPU_TRANSCRIBE_TIMEOUT_S: ClassVar[float] = 12.0
 
@@ -446,7 +447,7 @@ class FasterWhisperEngine:
         process.start()
 
         try:
-            ready = response_queue.get(timeout=self._GPU_PROBE_TIMEOUT_S)
+            ready = response_queue.get(timeout=self._GPU_STARTUP_TIMEOUT_S)
         except queue.Empty as exc:
             self._terminate_worker_process(process, request_queue, response_queue)
             raise _GpuWorkerTimeoutError(
@@ -782,7 +783,9 @@ class FasterWhisperEngine:
     def resolve_compute_backend(compute: str) -> tuple[str, str]:
         normalized = compute.strip().lower()
         if normalized == "auto":
-            return "auto", "int8"
+            if FasterWhisperEngine._has_cuda_device():
+                return "cuda", "float16"
+            return "cpu", "int8"
         if normalized == "cpu":
             return "cpu", "int8"
         if normalized == "cuda":
@@ -795,6 +798,18 @@ class FasterWhisperEngine:
                 return "auto", "int8"
             raise EngineUnavailableError("compute=metal is only valid on macOS.")
         raise EngineUnavailableError(f"Unsupported compute backend '{compute}' for faster-whisper.")
+
+    @staticmethod
+    def _has_cuda_device() -> bool:
+        try:
+            import ctranslate2
+        except Exception:
+            return False
+        try:
+            count = int(ctranslate2.get_cuda_device_count())
+        except Exception:
+            return False
+        return count > 0
 
     def _load_model(
         self,

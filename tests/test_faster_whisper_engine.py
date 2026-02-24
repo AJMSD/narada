@@ -176,98 +176,111 @@ def test_faster_whisper_auto_retries_on_cpu_when_cuda_runtime_fails() -> None:
     FasterWhisperEngine.clear_cache_for_tests()
     cpu_model = _FakeModel(model_sample_rate_hz=16000)
     gpu_attempts = {"count": 0}
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: True)
+    try:
 
-    def factory(model_name: str, device: str, compute_type: str) -> object:
-        if device == "cpu":
-            return cpu_model
-        raise AssertionError(f"Unexpected device: {device}")
+        def factory(model_name: str, device: str, compute_type: str) -> object:
+            if device == "cpu":
+                return cpu_model
+            raise AssertionError(f"Unexpected device: {device}")
 
-    engine = FasterWhisperEngine(model_factory=factory, availability_probe=lambda: True)
-    original_guarded = engine._transcribe_gpu_guarded
+        engine = FasterWhisperEngine(model_factory=factory, availability_probe=lambda: True)
+        original_guarded = engine._transcribe_gpu_guarded
 
-    def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
-        gpu_attempts["count"] += 1
-        raise _GpuWorkerRuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+        def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
+            gpu_attempts["count"] += 1
+            raise _GpuWorkerRuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
 
-    engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
-    request = TranscriptionRequest(
-        pcm_bytes=b"\x00\x00\x10\x00",
-        sample_rate_hz=16000,
-        languages=("auto",),
-        model="small",
-        compute="auto",
-    )
+        engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
+        request = TranscriptionRequest(
+            pcm_bytes=b"\x00\x00\x10\x00",
+            sample_rate_hz=16000,
+            languages=("auto",),
+            model="small",
+            compute="auto",
+        )
 
-    result = engine.transcribe(request)
-    engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
+        result = engine.transcribe(request)
+        engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
 
-    assert result[0].text == "hello world"
-    assert gpu_attempts["count"] == 1
-    assert engine._gpu_disabled_reason is not None
+        assert result[0].text == "hello world"
+        assert gpu_attempts["count"] == 1
+        assert engine._gpu_disabled_reason is not None
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
 
 
 def test_faster_whisper_gpu_timeout_falls_back_and_disables_gpu() -> None:
     FasterWhisperEngine.clear_cache_for_tests()
     cpu_model = _FakeModel(model_sample_rate_hz=16000)
     gpu_attempts = {"count": 0}
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: True)
+    try:
+        engine = FasterWhisperEngine(
+            model_factory=lambda *_args: cpu_model,
+            availability_probe=lambda: True,
+        )
+        original_guarded = engine._transcribe_gpu_guarded
 
-    engine = FasterWhisperEngine(
-        model_factory=lambda *_args: cpu_model,
-        availability_probe=lambda: True,
-    )
-    original_guarded = engine._transcribe_gpu_guarded
+        def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
+            gpu_attempts["count"] += 1
+            raise _GpuWorkerTimeoutError("GPU worker exceeded timeout (12.0s).")
 
-    def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
-        gpu_attempts["count"] += 1
-        raise _GpuWorkerTimeoutError("GPU worker exceeded timeout (12.0s).")
+        engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
+        request = TranscriptionRequest(
+            pcm_bytes=b"\x00\x00\x10\x00",
+            sample_rate_hz=16000,
+            languages=("auto",),
+            model="small",
+            compute="auto",
+        )
 
-    engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
-    request = TranscriptionRequest(
-        pcm_bytes=b"\x00\x00\x10\x00",
-        sample_rate_hz=16000,
-        languages=("auto",),
-        model="small",
-        compute="auto",
-    )
+        result = engine.transcribe(request)
+        second = engine.transcribe(request)
+        engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
 
-    result = engine.transcribe(request)
-    second = engine.transcribe(request)
-    engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
-
-    assert result[0].text == "hello world"
-    assert second[0].text == "hello world"
-    assert gpu_attempts["count"] == 1
-    assert engine._gpu_disabled_reason is not None
+        assert result[0].text == "hello world"
+        assert second[0].text == "hello world"
+        assert gpu_attempts["count"] == 1
+        assert engine._gpu_disabled_reason is not None
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
 
 
 def test_faster_whisper_gpu_materialization_error_falls_back_to_cpu() -> None:
     FasterWhisperEngine.clear_cache_for_tests()
     cpu_model = _FakeModel(model_sample_rate_hz=16000)
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: True)
+    try:
+        engine = FasterWhisperEngine(
+            model_factory=lambda *_args: cpu_model,
+            availability_probe=lambda: True,
+        )
+        original_guarded = engine._transcribe_gpu_guarded
 
-    engine = FasterWhisperEngine(
-        model_factory=lambda *_args: cpu_model,
-        availability_probe=lambda: True,
-    )
-    original_guarded = engine._transcribe_gpu_guarded
+        def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
+            raise _GpuWorkerRuntimeError(
+                "CUDA runtime failure while materializing segments: cublas cannot be loaded"
+            )
 
-    def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
-        raise _GpuWorkerRuntimeError(
-            "CUDA runtime failure while materializing segments: cublas cannot be loaded"
+        engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
+        request = TranscriptionRequest(
+            pcm_bytes=b"\x00\x00\x10\x00",
+            sample_rate_hz=16000,
+            languages=("auto",),
+            model="small",
+            compute="auto",
         )
 
-    engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
-    request = TranscriptionRequest(
-        pcm_bytes=b"\x00\x00\x10\x00",
-        sample_rate_hz=16000,
-        languages=("auto",),
-        model="small",
-        compute="auto",
-    )
-
-    result = engine.transcribe(request)
-    engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
-    assert result[0].text == "hello world"
-    assert engine._gpu_disabled_reason is not None
+        result = engine.transcribe(request)
+        engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
+        assert result[0].text == "hello world"
+        assert engine._gpu_disabled_reason is not None
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
 
 
 def test_faster_whisper_fast_preset_uses_fast_decode_in_process() -> None:
@@ -321,32 +334,55 @@ def test_faster_whisper_accurate_preset_enables_condition_on_previous_text() -> 
 
 
 def test_faster_whisper_passes_asr_preset_to_gpu_path() -> None:
-    engine = FasterWhisperEngine(
-        model_factory=lambda *_args: _FakeModel(),
-        availability_probe=lambda: True,
-    )
-    seen: dict[str, object] = {}
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: True)
+    try:
+        engine = FasterWhisperEngine(
+            model_factory=lambda *_args: _FakeModel(),
+            availability_probe=lambda: True,
+        )
+        seen: dict[str, object] = {}
 
-    def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
-        seen.update(kwargs)
-        return [{"text": "gpu result", "start_s": 0.0, "end_s": 1.0, "confidence": 0.9}]
+        def fake_guarded(**kwargs: object) -> list[dict[str, object]]:
+            seen.update(kwargs)
+            return [{"text": "gpu result", "start_s": 0.0, "end_s": 1.0, "confidence": 0.9}]
 
-    original_guarded = engine._transcribe_gpu_guarded
-    engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
-    request = TranscriptionRequest(
-        pcm_bytes=b"\x00\x00\x10\x00",
-        sample_rate_hz=16000,
-        languages=("en",),
-        model="small",
-        compute="auto",
-        asr_preset="accurate",
-    )
+        original_guarded = engine._transcribe_gpu_guarded
+        engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
+        request = TranscriptionRequest(
+            pcm_bytes=b"\x00\x00\x10\x00",
+            sample_rate_hz=16000,
+            languages=("en",),
+            model="small",
+            compute="auto",
+            asr_preset="accurate",
+        )
 
-    result = engine.transcribe(request)
-    engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
+        result = engine.transcribe(request)
+        engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
 
-    assert result[0].text == "gpu result"
-    assert seen["asr_preset"] == "accurate"
+        assert result[0].text == "gpu result"
+        assert seen["asr_preset"] == "accurate"
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
+
+
+def test_faster_whisper_compute_auto_prefers_cuda_when_available() -> None:
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: True)
+    try:
+        assert FasterWhisperEngine.resolve_compute_backend("auto") == ("cuda", "float16")
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
+
+
+def test_faster_whisper_compute_auto_uses_cpu_when_no_cuda() -> None:
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: False)
+    try:
+        assert FasterWhisperEngine.resolve_compute_backend("auto") == ("cpu", "int8")
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
 
 
 def test_faster_whisper_compute_metal_invalid_on_non_macos() -> None:
