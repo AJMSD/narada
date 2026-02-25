@@ -27,6 +27,21 @@ class _TTYStdin:
         return True
 
 
+class _TTYStdoutBuffer:
+    def __init__(self) -> None:
+        self.output = ""
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        self.output += text
+        return len(text)
+
+    def flush(self) -> None:
+        return
+
+
 @dataclass
 class _FakeCapture:
     frames: list[CapturedFrame]
@@ -647,9 +662,64 @@ def test_start_interrupt_displays_asr_shutdown_notice(
         )
         == 1
     )
-    assert "Application stopping. ASR completing first." in captured.out
-    assert "Will stop in about" in captured.out
+    assert "eta=~" in captured.out
     assert "shutdown notice transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_first_signal_before_first_status_render_emits_notice_once(
+    monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_path = tmp_path / "first-signal-before-status.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("early interrupt transcript", delay_s=0.01)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(12)])
+    original_drain = cli_module._drain_asr_results
+    state = {"raised": False}
+
+    def _interrupt_first_drain(**kwargs: Any):
+        if not state["raised"]:
+            state["raised"] = True
+            raise KeyboardInterrupt
+        return original_drain(**kwargs)
+
+    monkeypatch.setattr("narada.cli._drain_asr_results", _interrupt_first_drain)
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=5))
+
+    _run_start_for_tests()
+
+    captured = capsys.readouterr()
+    assert (
+        captured.err.count(
+            "Signal received. Stopping capture and draining ASR backlog to zero before exit."
+        )
+        == 1
+    )
+    assert "state=paused/draining" in captured.out
+    assert "eta=~" in captured.out
+    assert "early interrupt transcript" in out_path.read_text(encoding="utf-8")
 
 
 def test_start_status_freezes_elapsed_and_includes_compact_drain_metrics(
@@ -701,9 +771,111 @@ def test_start_status_freezes_elapsed_and_includes_compact_drain_metrics(
     assert paused_lines
     paused_elapsed = {line.split(" | ", 1)[0] for line in paused_lines}
     assert len(paused_elapsed) == 1
+    assert all("eta=~" in line for line in paused_lines)
     assert all("taskq=" in line and "pend=" in line and "plan=" in line for line in paused_lines)
     assert all("rtf=" in line and "asr=" in line for line in paused_lines)
     assert "paused elapsed transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_compacts_single_line_status_for_narrow_tty(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    out_path = tmp_path / "narrow-tty-status.txt"
+    cfg = _runtime_config(
+        "system",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("narrow tty transcript", delay_s=0.02)
+    system_capture = _FakeCapture(frames=[_frame() for _ in range(80)])
+    stream = _TTYStdoutBuffer()
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (None, AudioDevice(2, "Loopback", "loopback"), []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_system_capture", lambda *_args, **_kwargs: system_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.sys.stdout", stream)
+    monkeypatch.setattr("narada.cli._resolve_terminal_columns", lambda **_kwargs: 96)
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=4))
+
+    _run_start_for_tests()
+
+    status_lines: list[str] = []
+    for segment in stream.output.split("\r"):
+        first_line = segment.splitlines()[0] if segment else ""
+        if first_line.startswith("REC ") and " | asr=" in first_line:
+            status_lines.append(first_line)
+    assert status_lines
+    assert all(len(line) <= 96 for line in status_lines)
+    assert all(
+        "state=capturing" in line or "state=paused/draining" in line for line in status_lines
+    )
+    assert "narrow tty transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_breaks_single_line_before_backlog_warning_output(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    out_path = tmp_path / "warning-separation.txt"
+    cfg = _runtime_config(
+        "system",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+        asr_backlog_warn_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("warning separation transcript", delay_s=0.03)
+    system_capture = _FakeCapture(frames=[_frame() for _ in range(256)])
+    stream = _TTYStdoutBuffer()
+
+    def _warning_to_stdout(message: str, *_args: Any, **_kwargs: Any) -> None:
+        stream.write(f"WARNING {message}\n")
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (None, AudioDevice(2, "Loopback", "loopback"), []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_system_capture", lambda *_args, **_kwargs: system_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.sys.stdout", stream)
+    monkeypatch.setattr("narada.cli.logger.warning", _warning_to_stdout)
+    monkeypatch.setattr("narada.cli._resolve_terminal_columns", lambda **_kwargs: 110)
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=5))
+
+    _run_start_for_tests()
+
+    assert "WARNING Warning: ASR backlog is" in stream.output
+    assert "state=capturingWARNING" not in stream.output
+    assert "warning separation transcript" in out_path.read_text(encoding="utf-8")
 
 
 def test_start_sigterm_displays_sigterm_shutdown_reason(
