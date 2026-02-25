@@ -62,6 +62,12 @@ _DECODE_PRESETS: dict[str, _DecodePreset] = {
     "accurate": _DecodePreset(beam_size=5, vad_filter=True, condition_on_previous_text=True),
 }
 
+_GPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET: dict[str, float] = {
+    "fast": 0.30,
+    "balanced": 0.55,
+    "accurate": 0.75,
+}
+
 
 def _resolve_decode_preset(asr_preset: str | None) -> _DecodePreset:
     if asr_preset is None:
@@ -264,6 +270,12 @@ class FasterWhisperEngine:
     _GPU_STARTUP_TIMEOUT_S: ClassVar[float] = 20.0
     _GPU_PROBE_TIMEOUT_S: ClassVar[float] = 4.0
     _GPU_TRANSCRIBE_TIMEOUT_S: ClassVar[float] = 12.0
+    _GPU_TRANSCRIBE_TIMEOUT_BASE_S: ClassVar[float] = 8.0
+    _GPU_TRANSCRIBE_TIMEOUT_MAX_S: ClassVar[float] = 90.0
+    _GPU_LONG_WINDOW_THRESHOLD_S: ClassVar[float] = 120.0
+    _GPU_LONG_WINDOW_CHUNK_S: ClassVar[float] = 60.0
+    _GPU_LONG_WINDOW_OVERLAP_S: ClassVar[float] = 1.5
+    _GPU_TRANSCRIBE_MAX_ATTEMPTS: ClassVar[int] = 2
 
     def __init__(
         self,
@@ -349,39 +361,64 @@ class FasterWhisperEngine:
         if self._gpu_disabled_reason is not None:
             return None
 
-        try:
-            payload = self._transcribe_gpu_guarded(
-                model_reference=model_reference,
+        max_attempts = max(1, self._GPU_TRANSCRIBE_MAX_ATTEMPTS)
+        last_retryable_error: _GpuWorkerError | None = None
+        for attempt_idx in range(max_attempts):
+            try:
+                payload = self._transcribe_gpu_guarded(
+                    model_reference=model_reference,
+                    device=device,
+                    compute_type=compute_type,
+                    source_audio=source_audio,
+                    source_rate_hz=source_rate_hz,
+                    language=language,
+                    multilingual=multilingual,
+                    asr_preset=asr_preset,
+                )
+                return self._segments_from_worker_payload(payload)
+            except (_GpuWorkerTimeoutError, _GpuWorkerExitError) as exc:
+                last_retryable_error = exc
+                if attempt_idx + 1 < max_attempts:
+                    logger.warning(
+                        "GPU worker request failed (%s); retrying (%d/%d).",
+                        exc,
+                        attempt_idx + 1,
+                        max_attempts,
+                    )
+                    continue
+                self._disable_gpu_for_session(
+                    reason=str(exc),
+                    device=device,
+                    compute_type=compute_type,
+                )
+                return None
+            except _GpuWorkerRuntimeError as exc:
+                if self._should_retry_on_cpu(
+                    exc,
+                    device=device,
+                ):
+                    self._disable_gpu_for_session(
+                        reason=str(exc),
+                        device=device,
+                        compute_type=compute_type,
+                    )
+                    return None
+                raise EngineUnavailableError(
+                    f"faster-whisper failed to transcribe with model '{request.model}': {exc}"
+                ) from exc
+            except _GpuWorkerError as exc:
+                raise EngineUnavailableError(
+                    f"faster-whisper failed to transcribe with model '{request.model}': {exc}"
+                ) from exc
+
+        if last_retryable_error is not None:
+            self._disable_gpu_for_session(
+                reason=str(last_retryable_error),
                 device=device,
                 compute_type=compute_type,
-                source_audio=source_audio,
-                source_rate_hz=source_rate_hz,
-                language=language,
-                multilingual=multilingual,
-                asr_preset=asr_preset,
             )
-            return self._segments_from_worker_payload(payload)
-        except _GpuWorkerError as exc:
-            if isinstance(exc, (_GpuWorkerTimeoutError, _GpuWorkerExitError)):
-                self._disable_gpu_for_session(
-                    reason=str(exc),
-                    device=device,
-                    compute_type=compute_type,
-                )
-                return None
-            if isinstance(exc, _GpuWorkerRuntimeError) and self._should_retry_on_cpu(
-                exc,
-                device=device,
-            ):
-                self._disable_gpu_for_session(
-                    reason=str(exc),
-                    device=device,
-                    compute_type=compute_type,
-                )
-                return None
-            raise EngineUnavailableError(
-                f"faster-whisper failed to transcribe with model '{request.model}': {exc}"
-            ) from exc
+            return None
+        return None
 
     def _transcribe_gpu_guarded(
         self,
@@ -416,13 +453,52 @@ class FasterWhisperEngine:
             source_rate_hz=source_rate_hz,
             target_rate_hz=worker.sample_rate_hz,
         )
+        audio_seconds = self._audio_seconds_from_samples(
+            sample_count=worker_audio.shape[0],
+            sample_rate_hz=worker.sample_rate_hz,
+        )
+        if self._should_chunk_gpu_audio(audio_seconds=audio_seconds):
+            merged: list[dict[str, Any]] = []
+            for chunk_audio, chunk_offset_s in self._iter_gpu_audio_chunks(
+                audio=worker_audio,
+                sample_rate_hz=worker.sample_rate_hz,
+            ):
+                chunk_seconds = self._audio_seconds_from_samples(
+                    sample_count=chunk_audio.shape[0],
+                    sample_rate_hz=worker.sample_rate_hz,
+                )
+                chunk_timeout_s = self._compute_gpu_transcribe_timeout_s(
+                    audio_seconds=chunk_seconds,
+                    asr_preset=asr_preset,
+                )
+                chunk_payload = self._run_gpu_worker_request(
+                    worker=worker,
+                    audio=chunk_audio,
+                    language=language,
+                    multilingual=multilingual,
+                    asr_preset=asr_preset,
+                    timeout_s=chunk_timeout_s,
+                    probe=False,
+                )
+                merged.extend(
+                    self._offset_worker_payload(
+                        payload=chunk_payload,
+                        offset_s=chunk_offset_s,
+                    )
+                )
+            return merged
+
+        timeout_s = self._compute_gpu_transcribe_timeout_s(
+            audio_seconds=audio_seconds,
+            asr_preset=asr_preset,
+        )
         return self._run_gpu_worker_request(
             worker=worker,
             audio=worker_audio,
             language=language,
             multilingual=multilingual,
             asr_preset=asr_preset,
-            timeout_s=self._GPU_TRANSCRIBE_TIMEOUT_S,
+            timeout_s=timeout_s,
             probe=False,
         )
 
@@ -663,6 +739,75 @@ class FasterWhisperEngine:
         return parsed
 
     @staticmethod
+    def _audio_seconds_from_samples(*, sample_count: int, sample_rate_hz: int) -> float:
+        if sample_count <= 0 or sample_rate_hz <= 0:
+            return 0.0
+        return sample_count / sample_rate_hz
+
+    @classmethod
+    def _compute_gpu_transcribe_timeout_s(cls, *, audio_seconds: float, asr_preset: str) -> float:
+        normalized = asr_preset.strip().lower()
+        factor = _GPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET.get(
+            normalized,
+            _GPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET["balanced"],
+        )
+        raw_timeout_s = cls._GPU_TRANSCRIBE_TIMEOUT_BASE_S + (max(0.0, audio_seconds) * factor)
+        return min(
+            cls._GPU_TRANSCRIBE_TIMEOUT_MAX_S,
+            max(cls._GPU_TRANSCRIBE_TIMEOUT_S, raw_timeout_s),
+        )
+
+    @classmethod
+    def _should_chunk_gpu_audio(cls, *, audio_seconds: float) -> bool:
+        return audio_seconds > cls._GPU_LONG_WINDOW_THRESHOLD_S
+
+    @classmethod
+    def _iter_gpu_audio_chunks(
+        cls,
+        *,
+        audio: np.ndarray[Any, np.dtype[np.float32]],
+        sample_rate_hz: int,
+    ) -> list[tuple[np.ndarray[Any, np.dtype[np.float32]], float]]:
+        if audio.size == 0 or sample_rate_hz <= 0:
+            return []
+
+        chunk_samples = max(1, int(round(cls._GPU_LONG_WINDOW_CHUNK_S * sample_rate_hz)))
+        overlap_samples = max(0, int(round(cls._GPU_LONG_WINDOW_OVERLAP_S * sample_rate_hz)))
+        stride_samples = max(1, chunk_samples - overlap_samples)
+
+        chunks: list[tuple[np.ndarray[Any, np.dtype[np.float32]], float]] = []
+        start = 0
+        while start < audio.shape[0]:
+            end = min(audio.shape[0], start + chunk_samples)
+            chunk_audio = audio[start:end]
+            offset_s = start / sample_rate_hz
+            chunks.append((chunk_audio, offset_s))
+            if end >= audio.shape[0]:
+                break
+            start += stride_samples
+        return chunks
+
+    @staticmethod
+    def _offset_worker_payload(
+        *,
+        payload: Sequence[dict[str, Any]],
+        offset_s: float,
+    ) -> list[dict[str, Any]]:
+        if offset_s <= 0.0:
+            return [dict(item) for item in payload]
+        shifted: list[dict[str, Any]] = []
+        for item in payload:
+            copied = dict(item)
+            start_s = copied.get("start_s")
+            end_s = copied.get("end_s")
+            if isinstance(start_s, (int, float)):
+                copied["start_s"] = float(start_s) + offset_s
+            if isinstance(end_s, (int, float)):
+                copied["end_s"] = float(end_s) + offset_s
+            shifted.append(copied)
+        return shifted
+
+    @staticmethod
     def _parse_segments(segments_iter: Sequence[Any]) -> list[TranscriptSegment]:
         parsed: list[TranscriptSegment] = []
         for segment in segments_iter:
@@ -782,6 +927,7 @@ class FasterWhisperEngine:
     @staticmethod
     def resolve_compute_backend(compute: str) -> tuple[str, str]:
         normalized = compute.strip().lower()
+        os_name = platform.system().strip().lower()
         if normalized == "auto":
             if FasterWhisperEngine._has_cuda_device():
                 return "cuda", "float16"
@@ -789,13 +935,18 @@ class FasterWhisperEngine:
         if normalized == "cpu":
             return "cpu", "int8"
         if normalized == "cuda":
+            if os_name == "darwin":
+                logger.warning(
+                    "compute=cuda is not supported for faster-whisper on macOS; using cpu/int8."
+                )
+                return "cpu", "int8"
             return "cuda", "float16"
         if normalized == "metal":
-            if platform.system().lower() == "darwin":
+            if os_name == "darwin":
                 logger.warning(
-                    "faster-whisper does not expose a dedicated 'metal' device; using auto."
+                    "compute=metal is not supported for faster-whisper on macOS; using cpu/int8."
                 )
-                return "auto", "int8"
+                return "cpu", "int8"
             raise EngineUnavailableError("compute=metal is only valid on macOS.")
         raise EngineUnavailableError(f"Unsupported compute backend '{compute}' for faster-whisper.")
 

@@ -243,8 +243,44 @@ def test_faster_whisper_gpu_timeout_falls_back_and_disables_gpu() -> None:
 
         assert result[0].text == "hello world"
         assert second[0].text == "hello world"
-        assert gpu_attempts["count"] == 1
+        assert gpu_attempts["count"] == 2
         assert engine._gpu_disabled_reason is not None
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
+
+
+def test_faster_whisper_gpu_timeout_retry_succeeds_without_disabling_gpu() -> None:
+    FasterWhisperEngine.clear_cache_for_tests()
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: True)
+    try:
+        engine = FasterWhisperEngine(
+            model_factory=lambda *_args: _FakeModel(),
+            availability_probe=lambda: True,
+        )
+        attempts = {"count": 0}
+        original_guarded = engine._transcribe_gpu_guarded
+
+        def fake_guarded(**_kwargs: object) -> list[dict[str, object]]:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise _GpuWorkerTimeoutError("GPU worker exceeded timeout (12.0s).")
+            return [{"text": "gpu retry success", "start_s": 0.0, "end_s": 1.0, "confidence": 0.9}]
+
+        engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
+        request = TranscriptionRequest(
+            pcm_bytes=b"\x00\x00\x10\x00",
+            sample_rate_hz=16000,
+            languages=("en",),
+            model="small",
+            compute="auto",
+        )
+        result = engine.transcribe(request)
+        engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
+
+        assert result[0].text == "gpu retry success"
+        assert attempts["count"] == 2
+        assert engine._gpu_disabled_reason is None
     finally:
         FasterWhisperEngine._has_cuda_device = original_has_cuda
 
@@ -279,6 +315,36 @@ def test_faster_whisper_gpu_materialization_error_falls_back_to_cpu() -> None:
         engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
         assert result[0].text == "hello world"
         assert engine._gpu_disabled_reason is not None
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
+
+
+def test_faster_whisper_unknown_gpu_runtime_error_is_raised() -> None:
+    FasterWhisperEngine.clear_cache_for_tests()
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: True)
+    try:
+        engine = FasterWhisperEngine(
+            model_factory=lambda *_args: _FakeModel(),
+            availability_probe=lambda: True,
+        )
+        original_guarded = engine._transcribe_gpu_guarded
+
+        def fake_guarded(**_kwargs: object) -> list[dict[str, object]]:
+            raise _GpuWorkerRuntimeError("unexpected worker parse failure")
+
+        engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
+        request = TranscriptionRequest(
+            pcm_bytes=b"\x00\x00\x10\x00",
+            sample_rate_hz=16000,
+            languages=("en",),
+            model="small",
+            compute="auto",
+        )
+        with pytest.raises(EngineUnavailableError):
+            engine.transcribe(request)
+        engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
+        assert engine._gpu_disabled_reason is None
     finally:
         FasterWhisperEngine._has_cuda_device = original_has_cuda
 
@@ -385,6 +451,73 @@ def test_faster_whisper_compute_auto_uses_cpu_when_no_cuda() -> None:
         FasterWhisperEngine._has_cuda_device = original_has_cuda
 
 
-def test_faster_whisper_compute_metal_invalid_on_non_macos() -> None:
+def test_faster_whisper_compute_metal_invalid_on_non_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine.platform.system",
+        lambda: "Windows",
+    )
     with pytest.raises(EngineUnavailableError):
         FasterWhisperEngine.resolve_compute_backend("metal")
+
+
+def test_faster_whisper_gpu_timeout_policy_floor_scale_and_cap() -> None:
+    floor_timeout = FasterWhisperEngine._compute_gpu_transcribe_timeout_s(  # noqa: SLF001
+        audio_seconds=1.0,
+        asr_preset="fast",
+    )
+    balanced_timeout = FasterWhisperEngine._compute_gpu_transcribe_timeout_s(  # noqa: SLF001
+        audio_seconds=20.0,
+        asr_preset="balanced",
+    )
+    accurate_timeout = FasterWhisperEngine._compute_gpu_transcribe_timeout_s(  # noqa: SLF001
+        audio_seconds=20.0,
+        asr_preset="accurate",
+    )
+    capped_timeout = FasterWhisperEngine._compute_gpu_transcribe_timeout_s(  # noqa: SLF001
+        audio_seconds=10_000.0,
+        asr_preset="accurate",
+    )
+
+    assert floor_timeout == pytest.approx(12.0)
+    assert balanced_timeout == pytest.approx(19.0)
+    assert accurate_timeout == pytest.approx(23.0)
+    assert capped_timeout == pytest.approx(90.0)
+
+
+def test_faster_whisper_long_window_chunking_covers_all_audio_without_drop() -> None:
+    sample_rate_hz = 16000
+    # 125s should trigger long-window chunking.
+    audio = np.zeros(sample_rate_hz * 125, dtype=np.float32)
+    chunks = FasterWhisperEngine._iter_gpu_audio_chunks(  # noqa: SLF001
+        audio=audio,
+        sample_rate_hz=sample_rate_hz,
+    )
+
+    assert FasterWhisperEngine._should_chunk_gpu_audio(audio_seconds=125.0)  # noqa: SLF001
+    assert not FasterWhisperEngine._should_chunk_gpu_audio(audio_seconds=120.0)  # noqa: SLF001
+    assert chunks
+    assert chunks[0][1] == pytest.approx(0.0)
+    last_chunk, last_offset_s = chunks[-1]
+    assert last_offset_s + (last_chunk.shape[0] / sample_rate_hz) == pytest.approx(125.0)
+
+
+def test_faster_whisper_compute_cuda_on_macos_falls_back_to_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine.platform.system",
+        lambda: "Darwin",
+    )
+    assert FasterWhisperEngine.resolve_compute_backend("cuda") == ("cpu", "int8")
+
+
+def test_faster_whisper_compute_metal_on_macos_falls_back_to_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine.platform.system",
+        lambda: "Darwin",
+    )
+    assert FasterWhisperEngine.resolve_compute_backend("metal") == ("cpu", "int8")
