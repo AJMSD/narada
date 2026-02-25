@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import shutil
 import signal
 import sys
 import threading
@@ -174,6 +175,7 @@ class _LiveStatusRenderer:
         self._stream = stream if hasattr(stream, "write") else None
         self._line_count = 0
         self._single_line_active = False
+        self._single_line_rendered_chars = 0
         self._supports_ansi = bool(
             self._stream is not None and hasattr(self._stream, "isatty") and self._stream.isatty()
         )
@@ -212,17 +214,25 @@ class _LiveStatusRenderer:
         if not self._supports_ansi or self._stream is None:
             _safe_echo(normalized)
             self._single_line_active = False
+            self._single_line_rendered_chars = 0
             return
         try:
-            self._stream.write("\r\x1b[2K")
+            self._stream.write("\r")
             self._stream.write(normalized)
+            clear_tail_chars = self._single_line_rendered_chars - len(normalized)
+            if clear_tail_chars > 0:
+                self._stream.write(" " * clear_tail_chars)
+                self._stream.write("\r")
+                self._stream.write(normalized)
             self._stream.flush()
             self._single_line_active = True
+            self._single_line_rendered_chars = len(normalized)
             self._line_count = 0
         except Exception:
             self._supports_ansi = False
             self._line_count = 0
             self._single_line_active = False
+            self._single_line_rendered_chars = 0
             _safe_echo(normalized)
 
     def break_single_line(self) -> None:
@@ -237,6 +247,11 @@ class _LiveStatusRenderer:
         except Exception:
             pass
         self._single_line_active = False
+        self._single_line_rendered_chars = 0
+
+    @property
+    def supports_single_line(self) -> bool:
+        return self._supports_ansi and self._stream is not None
 
 
 @app.callback()
@@ -290,6 +305,43 @@ def _safe_echo(message: str, *, err: bool = False, nl: bool = True) -> None:
             fallback_stream.flush()
         except Exception:
             return
+
+
+def _resolve_terminal_columns(*, default_columns: int = 120) -> int:
+    try:
+        columns = int(shutil.get_terminal_size(fallback=(default_columns, 24)).columns)
+    except (OSError, TypeError, ValueError):
+        return default_columns
+    if columns <= 0:
+        return default_columns
+    return columns
+
+
+def _fit_status_line_to_terminal(
+    *,
+    required_fields: list[str],
+    optional_fields: list[str],
+    terminal_columns: int,
+) -> str:
+    selected_optional = list(optional_fields)
+    full_line = " | ".join(required_fields + selected_optional)
+    if terminal_columns <= 0 or len(full_line) <= terminal_columns:
+        return full_line
+
+    while selected_optional:
+        selected_optional.pop()
+        compact_line = " | ".join(required_fields + selected_optional)
+        if len(compact_line) <= terminal_columns:
+            return compact_line
+
+    required_only_line = " | ".join(required_fields)
+    if len(required_only_line) <= terminal_columns:
+        return required_only_line
+    if terminal_columns <= 1:
+        return required_only_line[:terminal_columns]
+    if terminal_columns <= 3:
+        return required_only_line[:terminal_columns]
+    return f"{required_only_line[: terminal_columns - 3]}..."
 
 
 def _estimate_shutdown_eta_seconds(
@@ -470,6 +522,7 @@ def _maybe_warn_capture_backlog(
     warn_threshold_s: float,
     now_monotonic: float,
     last_warned_at: float | None,
+    status_renderer: _LiveStatusRenderer | None = None,
 ) -> float | None:
     backlog_s = _estimate_capture_backlog_seconds(
         queued_frames=queued_frames,
@@ -486,6 +539,8 @@ def _maybe_warn_capture_backlog(
         f"Warning: {source_name} capture backlog is {backlog_s:.1f}s "
         f"({queued_frames} queued frames). ASR may be falling behind."
     )
+    if status_renderer is not None:
+        status_renderer.break_single_line()
     logger.warning(message)
     _safe_echo(message, err=True)
     return now_monotonic
@@ -520,6 +575,7 @@ def _maybe_warn_asr_backlog(
     warn_threshold_s: float,
     now_monotonic: float,
     last_warned_at: float | None,
+    status_renderer: _LiveStatusRenderer | None = None,
 ) -> float | None:
     if backlog_s < warn_threshold_s:
         return last_warned_at
@@ -528,6 +584,8 @@ def _maybe_warn_asr_backlog(
     ):
         return last_warned_at
     message = f"Warning: ASR backlog is {backlog_s:.1f}s. Notes may lag behind live audio."
+    if status_renderer is not None:
+        status_renderer.break_single_line()
     logger.warning(message)
     return now_monotonic
 
@@ -875,20 +933,46 @@ def _run_tty_notes_first(
         status_state = "paused/draining" if capture_paused else "capturing"
         planner_backlog_s = max(0.0, planner.pending_backlog_seconds())
         queued_tasks = _safe_queue_size(asr_task_queue)
-        status_line = (
-            f"REC {elapsed_text} | mode={config.mode} | model={config.model} | "
-            f"{performance.status_fragment()} | state={status_state} | taskq={queued_tasks} | "
-            f"pend={max(0.0, pending_asr_audio_seconds):.1f}s | plan={planner_backlog_s:.1f}s"
-        )
+        rtf = performance.realtime_factor
+        rtf_text = "n/a" if rtf is None else f"{rtf:.2f}"
+        commit_ms = performance.average_commit_latency_ms
+        commit_text = "n/a" if commit_ms is None else f"{commit_ms:.0f}ms"
+        required_fields = [
+            f"REC {elapsed_text}",
+            f"mode={config.mode}",
+            f"model={config.model}",
+            f"asr={max(0.0, asr_backlog_s):.1f}s",
+            f"state={status_state}",
+        ]
+        optional_fields = [
+            f"rtf={rtf_text}",
+            f"commit={commit_text}",
+            f"cap={performance.capture_backlog_s:.1f}s",
+            f"drop={performance.dropped_frames}",
+            f"taskq={queued_tasks}",
+            f"pend={max(0.0, pending_asr_audio_seconds):.1f}s",
+            f"plan={planner_backlog_s:.1f}s",
+        ]
         if include_shutdown_notice:
             shutdown_eta_s = _estimate_shutdown_eta_seconds(
                 asr_backlog_s=asr_backlog_s,
                 performance=performance,
             )
             reason_text = f" ({shutdown_reason})" if shutdown_reason else ""
-            status_line += (
-                " | Application stopping. ASR completing first. "
-                f"Will stop in about ~{shutdown_eta_s:.1f}s{reason_text}"
+            required_fields.append(f"eta=~{shutdown_eta_s:.1f}s{reason_text}")
+        terminal_columns = 0
+        if status_renderer.supports_single_line:
+            terminal_columns = _resolve_terminal_columns()
+        status_line = _fit_status_line_to_terminal(
+            required_fields=required_fields,
+            optional_fields=optional_fields,
+            terminal_columns=terminal_columns,
+        )
+        if include_shutdown_notice and "eta=~" not in status_line:
+            status_line = _fit_status_line_to_terminal(
+                required_fields=required_fields,
+                optional_fields=[],
+                terminal_columns=terminal_columns,
             )
         status_renderer.render_single_line(status_line)
 
@@ -1093,6 +1177,7 @@ def _run_tty_notes_first(
                     warn_threshold_s=config.capture_queue_warn_seconds,
                     now_monotonic=now_monotonic,
                     last_warned_at=last_capture_backlog_warning_at["mic"],
+                    status_renderer=status_renderer,
                 )
             if system_capture is not None and system_queue is not None:
                 system_queued_frames = system_queue.qsize() + len(system_pending)
@@ -1111,6 +1196,7 @@ def _run_tty_notes_first(
                     warn_threshold_s=config.capture_queue_warn_seconds,
                     now_monotonic=now_monotonic,
                     last_warned_at=last_capture_backlog_warning_at["system"],
+                    status_renderer=status_renderer,
                 )
             capture_backlog_s = max(capture_backlog_values) if capture_backlog_values else 0.0
             asr_backlog_s = _estimate_asr_remaining_seconds(
@@ -1122,6 +1208,7 @@ def _run_tty_notes_first(
                 warn_threshold_s=config.asr_backlog_warn_seconds,
                 now_monotonic=now_monotonic,
                 last_warned_at=last_asr_backlog_warning_at,
+                status_renderer=status_renderer,
             )
             performance.set_backlogs(
                 capture_backlog_s=capture_backlog_s,

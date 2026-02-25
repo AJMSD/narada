@@ -14,10 +14,12 @@ from narada.cli import (
     _estimate_asr_remaining_seconds,
     _estimate_capture_backlog_seconds,
     _estimate_shutdown_eta_seconds,
+    _fit_status_line_to_terminal,
     _format_elapsed_seconds,
     _LiveStatusRenderer,
     _maybe_warn_asr_backlog,
     _maybe_warn_capture_backlog,
+    _resolve_terminal_columns,
     _ShutdownSignalController,
 )
 from narada.config import RuntimeConfig
@@ -294,8 +296,8 @@ def test_live_status_renderer_single_line_ansi_updates_and_breaks(
     renderer.break_single_line()
     renderer.break_single_line()
 
-    assert "\r\x1b[2Kfirst" in stream.output
-    assert "\r\x1b[2Ksecond" in stream.output
+    assert "\rfirst" in stream.output
+    assert "\rsecond" in stream.output
     assert stream.output.count("\n") == 1
 
 
@@ -321,6 +323,127 @@ def test_live_status_renderer_single_line_falls_back_to_safe_echo(
     renderer.break_single_line()
 
     assert echoed == ["fallback status"]
+
+
+def test_live_status_renderer_single_line_clears_tail_when_line_shrinks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeStream:
+        def __init__(self) -> None:
+            self.output = ""
+
+        def isatty(self) -> bool:
+            return True
+
+        def write(self, text: str) -> int:
+            self.output += text
+            return len(text)
+
+        def flush(self) -> None:
+            return
+
+    stream = _FakeStream()
+    monkeypatch.setattr("narada.cli.sys.stdout", stream)
+    renderer = _LiveStatusRenderer()
+
+    renderer.render_single_line("longer-line")
+    renderer.render_single_line("short")
+
+    assert "short      " in stream.output
+
+
+def test_resolve_terminal_columns_uses_fallback_for_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "narada.cli.shutil.get_terminal_size",
+        lambda fallback: type("Size", (), {"columns": 0, "lines": fallback[1]})(),
+    )
+    assert _resolve_terminal_columns(default_columns=97) == 97
+
+
+def test_fit_status_line_to_terminal_preserves_priority_fields() -> None:
+    line = _fit_status_line_to_terminal(
+        required_fields=[
+            "REC 00:00:42",
+            "mode=system",
+            "model=small",
+            "asr=45.0s",
+            "state=capturing",
+        ],
+        optional_fields=[
+            "rtf=1.20",
+            "commit=9ms",
+            "cap=0.0s",
+            "drop=0",
+            "taskq=2",
+            "pend=36.0s",
+            "plan=9.0s",
+        ],
+        terminal_columns=72,
+    )
+    assert len(line) <= 72
+    assert "REC 00:00:42" in line
+    assert "mode=system" in line
+    assert "model=small" in line
+    assert "asr=45.0s" in line
+    assert "state=capturing" in line
+    assert "plan=9.0s" not in line
+
+
+def test_maybe_warn_capture_backlog_breaks_single_line_when_renderer_provided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Renderer:
+        def __init__(self) -> None:
+            self.break_calls = 0
+
+        def break_single_line(self) -> None:
+            self.break_calls += 1
+
+    echoed: list[str] = []
+    monkeypatch.setattr("narada.cli._safe_echo", lambda message, **_kwargs: echoed.append(message))
+    renderer = _Renderer()
+
+    _ = _maybe_warn_capture_backlog(
+        source_name="system",
+        queued_frames=320,
+        blocksize=1600,
+        sample_rate_hz=16000,
+        warn_threshold_s=10.0,
+        now_monotonic=50.0,
+        last_warned_at=None,
+        status_renderer=renderer,  # type: ignore[arg-type]
+    )
+
+    assert renderer.break_calls == 1
+    assert echoed
+
+
+def test_maybe_warn_asr_backlog_breaks_single_line_when_renderer_provided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Renderer:
+        def __init__(self) -> None:
+            self.break_calls = 0
+
+        def break_single_line(self) -> None:
+            self.break_calls += 1
+
+    warned: list[str] = []
+    monkeypatch.setattr("narada.cli.logger.warning", lambda message: warned.append(message))
+    renderer = _Renderer()
+
+    _ = _maybe_warn_asr_backlog(
+        backlog_s=60.0,
+        warn_threshold_s=45.0,
+        now_monotonic=10.0,
+        last_warned_at=None,
+        status_renderer=renderer,  # type: ignore[arg-type]
+    )
+
+    assert renderer.break_calls == 1
+    assert warned
 
 
 def test_shutdown_signal_controller_forces_exit_on_second_signal() -> None:
