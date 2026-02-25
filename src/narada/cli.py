@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
-from typing import cast
+from typing import Any, cast
 
 import typer
 
@@ -173,6 +173,7 @@ class _LiveStatusRenderer:
         stream = sys.stdout
         self._stream = stream if hasattr(stream, "write") else None
         self._line_count = 0
+        self._single_line_active = False
         self._supports_ansi = bool(
             self._stream is not None and hasattr(self._stream, "isatty") and self._stream.isatty()
         )
@@ -181,6 +182,8 @@ class _LiveStatusRenderer:
         if not lines:
             return
         normalized = [line.rstrip() for line in lines]
+        if self._single_line_active:
+            self.break_single_line()
         if not self._supports_ansi or self._stream is None:
             for line in normalized:
                 _safe_echo(line)
@@ -201,6 +204,39 @@ class _LiveStatusRenderer:
             self._line_count = 0
             for line in normalized:
                 _safe_echo(line)
+
+    def render_single_line(self, line: str) -> None:
+        normalized = line.rstrip()
+        if not normalized:
+            return
+        if not self._supports_ansi or self._stream is None:
+            _safe_echo(normalized)
+            self._single_line_active = False
+            return
+        try:
+            self._stream.write("\r\x1b[2K")
+            self._stream.write(normalized)
+            self._stream.flush()
+            self._single_line_active = True
+            self._line_count = 0
+        except Exception:
+            self._supports_ansi = False
+            self._line_count = 0
+            self._single_line_active = False
+            _safe_echo(normalized)
+
+    def break_single_line(self) -> None:
+        if not self._single_line_active:
+            return
+        if self._stream is None:
+            self._single_line_active = False
+            return
+        try:
+            self._stream.write("\n")
+            self._stream.flush()
+        except Exception:
+            pass
+        self._single_line_active = False
 
 
 @app.callback()
@@ -229,12 +265,16 @@ def _resolve_selected_devices(
     return resolved_mic, resolved_system, all_devices
 
 
-def _elapsed(started_at: float) -> str:
-    total = int(time.time() - started_at)
+def _format_elapsed_seconds(total_seconds: float) -> str:
+    total = max(0, int(total_seconds))
     hours = total // 3600
     minutes = (total % 3600) // 60
     seconds = total % 60
     return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+
+def _elapsed(started_at: float) -> str:
+    return _format_elapsed_seconds(time.time() - started_at)
 
 
 def _safe_echo(message: str, *, err: bool = False, nl: bool = True) -> None:
@@ -563,6 +603,7 @@ def _drain_asr_results(
     config: RuntimeConfig,
     performance: RuntimePerformance,
     started_at: float,
+    status_renderer: _LiveStatusRenderer | None = None,
 ) -> _AsrDrainSummary:
     drained = 0
     completed_audio_seconds = 0.0
@@ -583,6 +624,8 @@ def _drain_asr_results(
                 f"for bytes [{result.task.start_byte}, {result.task.end_byte}): {result.error}"
             )
             logger.warning(message)
+            if status_renderer is not None:
+                status_renderer.break_single_line()
             _safe_echo(message, err=True)
             continue
         if result.segments:
@@ -650,6 +693,11 @@ def _run_tty_notes_first(
     total_asr_success_count = 0
     total_asr_error_count = 0
     total_asr_empty_count = 0
+    capture_stop_requested = False
+    shutdown_drain_notice_emitted = False
+    capture_clock_started_monotonic = time.monotonic()
+    captured_elapsed_frozen_s: float | None = None
+    capture_paused = False
 
     def _apply_drain_summary(summary: _AsrDrainSummary) -> int:
         nonlocal pending_asr_audio_seconds
@@ -690,6 +738,7 @@ def _run_tty_notes_first(
         system_frames: deque[CapturedFrame],
         now_monotonic: float,
         max_frames: int | None,
+        allow_unpaired_mixed: bool = False,
     ) -> int:
         if max_frames is not None and max_frames <= 0:
             return 0
@@ -748,40 +797,141 @@ def _run_tty_notes_first(
                     now_monotonic=now_monotonic,
                 )
                 ingested += 1
+            if not allow_unpaired_mixed:
+                return ingested
+
+            def _silence_frame_like(frame: CapturedFrame) -> CapturedFrame:
+                return CapturedFrame(
+                    pcm_bytes=bytes(len(frame.pcm_bytes)),
+                    sample_rate_hz=frame.sample_rate_hz,
+                    channels=frame.channels,
+                )
+
+            while (mic_frames or system_frames) and not _limit_reached():
+                maybe_mic_frame = mic_frames.popleft() if mic_frames else None
+                maybe_system_frame = system_frames.popleft() if system_frames else None
+                if maybe_mic_frame is None and maybe_system_frame is None:
+                    break
+                if maybe_mic_frame is None:
+                    assert maybe_system_frame is not None
+                    maybe_mic_frame = _silence_frame_like(maybe_system_frame)
+                if maybe_system_frame is None:
+                    assert maybe_mic_frame is not None
+                    maybe_system_frame = _silence_frame_like(maybe_mic_frame)
+                mixed_samples, mixed_rate = mix_audio_chunks(
+                    AudioChunk(
+                        samples=pcm16le_to_float32(maybe_mic_frame.pcm_bytes),
+                        sample_rate_hz=maybe_mic_frame.sample_rate_hz,
+                        channels=maybe_mic_frame.channels,
+                    ),
+                    AudioChunk(
+                        samples=pcm16le_to_float32(maybe_system_frame.pcm_bytes),
+                        sample_rate_hz=maybe_system_frame.sample_rate_hz,
+                        channels=maybe_system_frame.channels,
+                    ),
+                    resync_state=mixed_resync_state,
+                )
+                _ingest_pcm_for_notes(
+                    mono_frame_to_pcm16le(
+                        MonoAudioFrame(samples=tuple(mixed_samples), sample_rate_hz=mixed_rate)
+                    ),
+                    mixed_rate,
+                    1,
+                    now_monotonic=now_monotonic,
+                )
+                ingested += 1
+            return ingested
         return ingested
 
-    def _render_live_status(*, asr_backlog_s: float, include_shutdown_notice: bool = False) -> None:
-        warning_backlog_s = (
-            asr_backlog_s if asr_backlog_s >= config.asr_backlog_warn_seconds else None
+    def _current_capture_elapsed_seconds(*, now_monotonic: float) -> float:
+        if captured_elapsed_frozen_s is not None:
+            return captured_elapsed_frozen_s
+        return max(0.0, now_monotonic - capture_clock_started_monotonic)
+
+    def _pause_capture_clock(*, now_monotonic: float) -> None:
+        nonlocal captured_elapsed_frozen_s
+        nonlocal capture_paused
+        if captured_elapsed_frozen_s is not None:
+            return
+        captured_elapsed_frozen_s = max(0.0, now_monotonic - capture_clock_started_monotonic)
+        capture_paused = True
+
+    def _safe_queue_size(source_queue: queue.Queue[Any] | None) -> int:
+        if source_queue is None:
+            return 0
+        try:
+            return max(0, source_queue.qsize())
+        except (NotImplementedError, AttributeError):
+            return 0
+
+    def _render_live_status(
+        *,
+        asr_backlog_s: float,
+        include_shutdown_notice: bool = False,
+        now_monotonic: float | None = None,
+    ) -> None:
+        now = now_monotonic if now_monotonic is not None else time.monotonic()
+        elapsed_text = _format_elapsed_seconds(_current_capture_elapsed_seconds(now_monotonic=now))
+        status_state = "paused/draining" if capture_paused else "capturing"
+        planner_backlog_s = max(0.0, planner.pending_backlog_seconds())
+        queued_tasks = _safe_queue_size(asr_task_queue)
+        status_line = (
+            f"REC {elapsed_text} | mode={config.mode} | model={config.model} | "
+            f"{performance.status_fragment()} | state={status_state} | taskq={queued_tasks} | "
+            f"pend={max(0.0, pending_asr_audio_seconds):.1f}s | plan={planner_backlog_s:.1f}s"
         )
-        shutdown_eta_s = (
-            _estimate_shutdown_eta_seconds(asr_backlog_s=asr_backlog_s, performance=performance)
-            if include_shutdown_notice
-            else None
-        )
-        status_renderer.render(
-            _build_live_status_lines(
-                config=config,
-                started_at=started_at,
+        if include_shutdown_notice:
+            shutdown_eta_s = _estimate_shutdown_eta_seconds(
+                asr_backlog_s=asr_backlog_s,
                 performance=performance,
-                asr_backlog_warning_s=warning_backlog_s,
-                shutdown_eta_s=shutdown_eta_s,
-                shutdown_reason=shutdown_reason if include_shutdown_notice else None,
             )
-        )
+            reason_text = f" ({shutdown_reason})" if shutdown_reason else ""
+            status_line += (
+                " | Application stopping. ASR completing first. "
+                f"Will stop in about ~{shutdown_eta_s:.1f}s{reason_text}"
+            )
+        status_renderer.render_single_line(status_line)
+
+    def _echo_runtime_event(message: str, *, err: bool = False) -> None:
+        status_renderer.break_single_line()
+        _safe_echo(message, err=err)
 
     def _raise_for_forced_shutdown_if_needed() -> None:
         if not shutdown_signals.force_exit_requested:
             return
-        _safe_echo(
+        _echo_runtime_event(
             "Forced stop requested by second signal. Exiting before ASR backlog reaches zero.",
             err=True,
         )
         raise typer.Exit(code=shutdown_signals.force_exit_code or _SIGINT_EXIT_CODE)
 
+    def _stop_capture_sources() -> None:
+        nonlocal capture_stop_requested
+        if capture_stop_requested:
+            return
+        _pause_capture_clock(now_monotonic=time.monotonic())
+        capture_stop_requested = True
+        capture_stop.set()
+        if mic_capture is not None:
+            mic_capture.close()
+        if system_capture is not None:
+            system_capture.close()
+
+    def _emit_shutdown_drain_notice_once() -> None:
+        nonlocal shutdown_drain_notice_emitted
+        if shutdown_drain_notice_emitted:
+            return
+        _echo_runtime_event(
+            "Signal received. Stopping capture and draining ASR backlog to zero before exit.",
+            err=True,
+        )
+        shutdown_drain_notice_emitted = True
+
     def _handle_interrupt() -> None:
         shutdown_signals.note_keyboard_interrupt()
         _raise_for_forced_shutdown_if_needed()
+        _stop_capture_sources()
+        _emit_shutdown_drain_notice_once()
 
     try:
         if config.mode in {"mic", "mixed"} and mic_device is not None:
@@ -876,6 +1026,7 @@ def _run_tty_notes_first(
                 config=config,
                 performance=performance,
                 started_at=cycle_started_at,
+                status_renderer=status_renderer,
             )
             if _apply_drain_summary(pre_drain_summary) > 0:
                 processed_any = True
@@ -919,6 +1070,7 @@ def _run_tty_notes_first(
                 config=config,
                 performance=performance,
                 started_at=cycle_started_at,
+                status_renderer=status_renderer,
             )
             if _apply_drain_summary(post_drain_summary) > 0:
                 processed_any = True
@@ -983,7 +1135,7 @@ def _run_tty_notes_first(
             performance.set_dropped_frames(dropped_frames=dropped_frames)
 
             if now_monotonic >= next_status_at:
-                _render_live_status(asr_backlog_s=asr_backlog_s)
+                _render_live_status(asr_backlog_s=asr_backlog_s, now_monotonic=now_monotonic)
                 next_status_at = now_monotonic + 1.0
 
             if not processed_any:
@@ -1007,16 +1159,22 @@ def _run_tty_notes_first(
                 config=config,
                 performance=performance,
                 started_at=time.perf_counter(),
+                status_renderer=status_renderer,
             )
             return _apply_drain_summary(summary)
 
         def _render_shutdown_status() -> None:
+            now_monotonic = time.monotonic()
             asr_backlog_s = _estimate_asr_remaining_seconds(
                 planner_backlog_s=planner.pending_backlog_seconds(),
                 pending_asr_audio_s=pending_asr_audio_seconds,
             )
             performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
-            _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
+            _render_live_status(
+                asr_backlog_s=asr_backlog_s,
+                include_shutdown_notice=True,
+                now_monotonic=now_monotonic,
+            )
 
         def _safe_shutdown_sleep(seconds: float = 0.01) -> None:
             try:
@@ -1040,20 +1198,8 @@ def _run_tty_notes_first(
                     _handle_interrupt()
                     continue
 
-        def _safe_queue_size(source_queue: queue.Queue[CapturedFrame] | None) -> int:
-            if source_queue is None:
-                return 0
-            try:
-                return source_queue.qsize()
-            except (NotImplementedError, AttributeError):
-                return 0
-
-        capture_stop.set()
         # Close handles first so blocking backend reads can unblock before joins.
-        if mic_capture is not None:
-            mic_capture.close()
-        if system_capture is not None:
-            system_capture.close()
+        _stop_capture_sources()
         for thread in capture_threads:
             thread.join(timeout=1.0)
 
@@ -1080,6 +1226,7 @@ def _run_tty_notes_first(
                 system_frames=system_pending_final,
                 now_monotonic=now_monotonic,
                 max_frames=_SHUTDOWN_INGEST_MAX_FRAMES_PER_CYCLE,
+                allow_unpaired_mixed=True,
             )
 
             queued_tasks = 0
@@ -1111,7 +1258,7 @@ def _run_tty_notes_first(
                 )
                 >= _SHUTDOWN_PROGRESS_WARNING_INTERVAL_S
             ):
-                _safe_echo(
+                _echo_runtime_event(
                     (
                         "Shutdown in progress: draining capture backlog "
                         f"({remaining_capture_frames} queued frames pending)."
@@ -1211,10 +1358,11 @@ def _run_tty_notes_first(
                 f"errors={total_asr_error_count}, empty={total_asr_empty_count}."
             )
             logger.warning(warning_message)
-            _safe_echo(warning_message, err=True)
+            _echo_runtime_event(warning_message, err=True)
         performance.record_end_to_notes(
             elapsed_seconds=time.perf_counter() - finalization_started_at
         )
+        status_renderer.break_single_line()
 
         if spool is not None:
             spool.cleanup(keep_files=spool_keep_files)
