@@ -308,19 +308,20 @@ class IntervalPlanner:
         return task
 
     def pending_backlog_seconds(self) -> float:
+        pending_seconds = 0.0
         if (
-            self._segment_start_byte is None
-            or self._segment_end_byte is None
-            or self._bytes_per_second is None
-            or self._bytes_per_second <= 0
+            self._segment_start_byte is not None
+            and self._segment_end_byte is not None
+            and self._bytes_per_second is not None
+            and self._bytes_per_second > 0
         ):
-            return 0.0
-        pending_bytes = self._segment_end_byte - (
-            self._segment_start_byte + self._next_window_start_rel_byte
-        )
-        if pending_bytes <= 0:
-            return 0.0
-        return pending_bytes / self._bytes_per_second
+            pending_bytes = self._segment_end_byte - (
+                self._segment_start_byte + self._next_window_start_rel_byte
+            )
+            if pending_bytes > 0:
+                pending_seconds += pending_bytes / self._bytes_per_second
+        pending_seconds += sum(task.audio_seconds for task in self._pending_forced_tasks)
+        return pending_seconds
 
     def build_final_tasks(self, *, now_monotonic: float | None = None) -> list[AsrTask]:
         created_at = now_monotonic if now_monotonic is not None else time.monotonic()
@@ -329,4 +330,9 @@ class IntervalPlanner:
         tail = self._build_tail_task(label="final-tail", created_monotonic=created_at)
         if tail is not None:
             tasks.append(tail)
+        if self._segment_start_byte is not None and self._segment_end_byte is not None:
+            self._next_window_start_rel_byte = max(
+                self._next_window_start_rel_byte,
+                self._segment_end_byte - self._segment_start_byte,
+            )
         return tasks

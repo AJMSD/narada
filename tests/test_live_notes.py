@@ -112,3 +112,26 @@ def test_interval_planner_flushes_tail_on_format_change() -> None:
     assert forced.sample_rate_hz == 4
     assert forced.start_byte == 12
     assert forced.end_byte == 24
+
+
+def test_interval_planner_pending_backlog_counts_forced_tasks() -> None:
+    planner = IntervalPlanner(interval_seconds=2.0, overlap_seconds=0.5)
+    planner.ingest_record(_record(0, 16, sample_rate_hz=4))
+    _ = planner.pop_next_ready_task()
+    planner.ingest_record(_record(16, 24, sample_rate_hz=4))
+    planner.ingest_record(_record(24, 32, sample_rate_hz=8))
+
+    backlog_s = planner.pending_backlog_seconds()
+    assert backlog_s == pytest.approx(2.0)
+
+
+def test_interval_planner_build_final_tasks_marks_pending_backlog_as_drained() -> None:
+    planner = IntervalPlanner(interval_seconds=2.0, overlap_seconds=0.5)
+    planner.ingest_record(_record(0, 8))
+    planner.ingest_record(_record(8, 16))
+
+    assert planner.pending_backlog_seconds() > 0.0
+    final_tasks = planner.build_final_tasks()
+
+    assert final_tasks
+    assert planner.pending_backlog_seconds() == pytest.approx(0.0)

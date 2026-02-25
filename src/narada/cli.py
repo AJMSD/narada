@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -68,6 +69,12 @@ app = typer.Typer(add_completion=False, no_args_is_help=True, help="Narada local
 logger = logging.getLogger("narada.cli")
 _BACKLOG_WARNING_INTERVAL_S = 30.0
 _ASR_TASK_QUEUE_MAX = 2
+
+
+@dataclass(frozen=True)
+class _AsrDrainSummary:
+    drained_count: int
+    completed_audio_seconds: float
 
 
 class _LiveStatusRenderer:
@@ -348,6 +355,14 @@ def _estimate_asr_backlog_seconds(
     return planner_backlog_s + (queued_tasks * interval_s)
 
 
+def _estimate_asr_remaining_seconds(
+    *,
+    planner_backlog_s: float,
+    pending_asr_audio_s: float,
+) -> float:
+    return max(0.0, planner_backlog_s) + max(0.0, pending_asr_audio_s)
+
+
 def _maybe_warn_asr_backlog(
     *,
     backlog_s: float,
@@ -380,6 +395,7 @@ def _asr_worker_loop(
         except queue.Empty:
             continue
         if task is None:
+            task_queue.task_done()
             return
         started = time.perf_counter()
         try:
@@ -412,6 +428,8 @@ def _asr_worker_loop(
                     error=str(exc),
                 )
             )
+        finally:
+            task_queue.task_done()
 
 
 def _enqueue_interval_task(
@@ -434,14 +452,16 @@ def _drain_asr_results(
     config: RuntimeConfig,
     performance: RuntimePerformance,
     started_at: float,
-) -> int:
+) -> _AsrDrainSummary:
     drained = 0
+    completed_audio_seconds = 0.0
     while True:
         try:
             result = result_queue.get_nowait()
         except queue.Empty:
             break
         drained += 1
+        completed_audio_seconds += max(0.0, result.audio_seconds)
         if result.error is not None:
             message = (
                 f"Warning: ASR task '{result.task.label}' failed "
@@ -462,7 +482,10 @@ def _drain_asr_results(
             performance=performance,
             started_at=started_at,
         )
-    return drained
+    return _AsrDrainSummary(
+        drained_count=drained,
+        completed_audio_seconds=completed_audio_seconds,
+    )
 
 
 def _run_tty_notes_first(
@@ -500,6 +523,15 @@ def _run_tty_notes_first(
         interval_seconds=config.notes_interval_seconds,
         overlap_seconds=config.notes_overlap_seconds,
     )
+    pending_asr_audio_seconds = 0.0
+
+    def _apply_drain_summary(summary: _AsrDrainSummary) -> int:
+        nonlocal pending_asr_audio_seconds
+        pending_asr_audio_seconds = max(
+            0.0,
+            pending_asr_audio_seconds - summary.completed_audio_seconds,
+        )
+        return summary.drained_count
 
     def _drain_capture_queue_to_pending(
         source_queue: queue.Queue[CapturedFrame] | None,
@@ -692,9 +724,10 @@ def _run_tty_notes_first(
                     break
                 if not _enqueue_interval_task(task_queue=asr_task_queue, task=task):
                     break
+                pending_asr_audio_seconds += task.audio_seconds
                 processed_any = True
 
-            drained = _drain_asr_results(
+            drain_summary = _drain_asr_results(
                 result_queue=asr_result_queue,
                 gate_state=live_gate_state,
                 writer=writer,
@@ -702,6 +735,7 @@ def _run_tty_notes_first(
                 performance=performance,
                 started_at=cycle_started_at,
             )
+            drained = _apply_drain_summary(drain_summary)
             if drained > 0:
                 processed_any = True
 
@@ -743,10 +777,9 @@ def _run_tty_notes_first(
                     last_warned_at=last_capture_backlog_warning_at["system"],
                 )
             capture_backlog_s = max(capture_backlog_values) if capture_backlog_values else 0.0
-            asr_backlog_s = _estimate_asr_backlog_seconds(
+            asr_backlog_s = _estimate_asr_remaining_seconds(
                 planner_backlog_s=planner.pending_backlog_seconds(),
-                queued_tasks=asr_task_queue.qsize(),
-                interval_s=config.notes_interval_seconds,
+                pending_asr_audio_s=pending_asr_audio_seconds,
             )
             last_asr_backlog_warning_at = _maybe_warn_asr_backlog(
                 backlog_s=asr_backlog_s,
@@ -780,7 +813,53 @@ def _run_tty_notes_first(
         raise
     finally:
         finalization_started_at = time.perf_counter()
+
+        def _drain_asr_results_for_shutdown() -> int:
+            summary = _drain_asr_results(
+                result_queue=asr_result_queue,
+                gate_state=live_gate_state,
+                writer=writer,
+                config=config,
+                performance=performance,
+                started_at=time.perf_counter(),
+            )
+            return _apply_drain_summary(summary)
+
+        def _render_shutdown_status() -> None:
+            asr_backlog_s = _estimate_asr_remaining_seconds(
+                planner_backlog_s=planner.pending_backlog_seconds(),
+                pending_asr_audio_s=pending_asr_audio_seconds,
+            )
+            performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
+            _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
+
+        def _safe_shutdown_sleep(seconds: float = 0.01) -> None:
+            try:
+                time.sleep(seconds)
+            except KeyboardInterrupt:
+                return
+
+        def _enqueue_task_with_shutdown_backpressure(task: AsrTask) -> bool:
+            nonlocal pending_asr_audio_seconds
+            while True:
+                try:
+                    if _enqueue_interval_task(task_queue=asr_task_queue, task=task):
+                        pending_asr_audio_seconds += task.audio_seconds
+                        return True
+                    _drain_asr_results_for_shutdown()
+                    _render_shutdown_status()
+                    if asr_thread is None or not asr_thread.is_alive():
+                        return False
+                    _safe_shutdown_sleep()
+                except KeyboardInterrupt:
+                    continue
+
         capture_stop.set()
+        # Close handles first so blocking backend reads can unblock before joins.
+        if mic_capture is not None:
+            mic_capture.close()
+        if system_capture is not None:
+            system_capture.close()
         for thread in capture_threads:
             thread.join(timeout=1.0)
 
@@ -834,93 +913,66 @@ def _run_tty_notes_first(
                     now_monotonic=now_monotonic,
                 )
 
-        while not asr_task_queue.full():
+        while True:
             task = planner.pop_next_ready_task(now_monotonic=now_monotonic)
             if task is None:
                 break
-            _enqueue_interval_task(task_queue=asr_task_queue, task=task)
+            if not _enqueue_task_with_shutdown_backpressure(task):
+                break
 
         final_tasks = planner.build_final_tasks(now_monotonic=now_monotonic)
         for task in final_tasks:
-            while not _enqueue_interval_task(task_queue=asr_task_queue, task=task):
-                _drain_asr_results(
-                    result_queue=asr_result_queue,
-                    gate_state=live_gate_state,
-                    writer=writer,
-                    config=config,
-                    performance=performance,
-                    started_at=time.perf_counter(),
-                )
-                if asr_thread is None or not asr_thread.is_alive():
-                    break
-                asr_backlog_s = _estimate_asr_backlog_seconds(
-                    planner_backlog_s=planner.pending_backlog_seconds(),
-                    queued_tasks=asr_task_queue.qsize(),
-                    interval_s=config.notes_interval_seconds,
-                )
-                performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
-                _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
-                time.sleep(0.01)
+            if not _enqueue_task_with_shutdown_backpressure(task):
+                break
 
-        asr_backlog_s = _estimate_asr_backlog_seconds(
-            planner_backlog_s=planner.pending_backlog_seconds(),
-            queued_tasks=asr_task_queue.qsize(),
-            interval_s=config.notes_interval_seconds,
-        )
-        performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
-        _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
+        _render_shutdown_status()
 
         while True:
             try:
                 asr_task_queue.put_nowait(None)
                 break
+            except KeyboardInterrupt:
+                continue
             except queue.Full:
-                _drain_asr_results(
-                    result_queue=asr_result_queue,
-                    gate_state=live_gate_state,
-                    writer=writer,
-                    config=config,
-                    performance=performance,
-                    started_at=time.perf_counter(),
-                )
-                if asr_thread is None or not asr_thread.is_alive():
-                    break
-                asr_backlog_s = _estimate_asr_backlog_seconds(
-                    planner_backlog_s=planner.pending_backlog_seconds(),
-                    queued_tasks=asr_task_queue.qsize(),
-                    interval_s=config.notes_interval_seconds,
-                )
-                performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
-                _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
-                time.sleep(0.01)
-
+                try:
+                    _drain_asr_results_for_shutdown()
+                    if asr_thread is None or not asr_thread.is_alive():
+                        break
+                    _render_shutdown_status()
+                    _safe_shutdown_sleep()
+                except KeyboardInterrupt:
+                    continue
         if asr_thread is not None:
-            while asr_thread.is_alive():
-                _drain_asr_results(
-                    result_queue=asr_result_queue,
-                    gate_state=live_gate_state,
-                    writer=writer,
-                    config=config,
-                    performance=performance,
-                    started_at=time.perf_counter(),
-                )
-                asr_backlog_s = _estimate_asr_backlog_seconds(
-                    planner_backlog_s=planner.pending_backlog_seconds(),
-                    queued_tasks=asr_task_queue.qsize(),
-                    interval_s=config.notes_interval_seconds,
-                )
-                performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
-                _render_live_status(asr_backlog_s=asr_backlog_s, include_shutdown_notice=True)
-                asr_thread.join(timeout=0.1)
+            queue_join_complete = threading.Event()
 
-        _drain_asr_results(
-            result_queue=asr_result_queue,
-            gate_state=live_gate_state,
-            writer=writer,
-            config=config,
-            performance=performance,
-            started_at=time.perf_counter(),
-        )
+            def _wait_for_asr_queue() -> None:
+                asr_task_queue.join()
+                queue_join_complete.set()
+
+            queue_join_thread = threading.Thread(
+                target=_wait_for_asr_queue,
+                daemon=True,
+                name="narada-asr-join",
+            )
+            queue_join_thread.start()
+            while not queue_join_complete.is_set():
+                try:
+                    _drain_asr_results_for_shutdown()
+                    _render_shutdown_status()
+                    asr_thread.join(timeout=0.1)
+                    _safe_shutdown_sleep()
+                except KeyboardInterrupt:
+                    continue
+            queue_join_thread.join(timeout=0.1)
+            asr_thread.join(timeout=1.0)
+
+        while True:
+            try:
+                drained_count = _drain_asr_results_for_shutdown()
+            except KeyboardInterrupt:
+                continue
+            if drained_count <= 0:
+                break
         performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=0.0)
         _render_live_status(asr_backlog_s=0.0, include_shutdown_notice=True)
         pending_live = live_gate_state.drain_pending(force_low_conf=True)
@@ -935,10 +987,6 @@ def _run_tty_notes_first(
             elapsed_seconds=time.perf_counter() - finalization_started_at
         )
 
-        if mic_capture is not None:
-            mic_capture.close()
-        if system_capture is not None:
-            system_capture.close()
         if spool is not None:
             spool.cleanup(keep_files=spool_keep_files)
 
