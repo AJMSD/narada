@@ -18,6 +18,18 @@ from narada.asr.model_discovery import resolve_whisper_cpp_model_path
 
 logger = logging.getLogger("narada.asr.whisper_cpp")
 
+_WHISPER_CPP_TIMEOUT_PER_AUDIO_SECOND_GPU: dict[str, float] = {
+    "fast": 0.80,
+    "balanced": 1.10,
+    "accurate": 1.40,
+}
+
+_WHISPER_CPP_TIMEOUT_PER_AUDIO_SECOND_CPU: dict[str, float] = {
+    "fast": 1.20,
+    "balanced": 1.90,
+    "accurate": 2.60,
+}
+
 
 @dataclass(frozen=True)
 class WhisperCliCapabilities:
@@ -41,6 +53,11 @@ class WhisperCppEngine:
     _warmed: ClassVar[set[tuple[str, str]]] = set()
     _capability_cache: ClassVar[dict[str, WhisperCliCapabilities]] = {}
     _cache_lock: ClassVar[Lock] = Lock()
+    _TRANSCRIBE_TIMEOUT_MIN_S: ClassVar[float] = 20.0
+    _TRANSCRIBE_TIMEOUT_BASE_GPU_S: ClassVar[float] = 15.0
+    _TRANSCRIBE_TIMEOUT_BASE_CPU_S: ClassVar[float] = 30.0
+    _TRANSCRIBE_TIMEOUT_MAX_GPU_S: ClassVar[float] = 600.0
+    _TRANSCRIBE_TIMEOUT_MAX_CPU_S: ClassVar[float] = 1800.0
 
     def __init__(
         self,
@@ -91,16 +108,54 @@ class WhisperCppEngine:
                 "-otxt",
                 "-np",
             ]
-            cmd.extend(runtime.compute_args)
             language = self._choose_language(request.languages)
-            if language is not None:
-                cmd.extend(["-l", language])
-
-            result = self._run_fn(cmd, capture_output=True, text=True, check=False)
-            if result.returncode != 0:
-                raise EngineUnavailableError(
-                    f"whisper.cpp transcription failed: {(result.stderr or result.stdout).strip()}"
+            duration_s = len(request.pcm_bytes) / 2.0 / request.sample_rate_hz
+            retry_runtime = runtime
+            if runtime.requested_compute in {"auto", "cuda", "metal"}:
+                cpu_runtime = self._resolve_runtime(request.model, "cpu")
+                if cpu_runtime.compute_args != runtime.compute_args:
+                    retry_runtime = cpu_runtime
+            result: subprocess.CompletedProcess[str] | None = None
+            for attempt_idx in range(2):
+                selected_runtime = runtime if attempt_idx == 0 else retry_runtime
+                self._warmup(selected_runtime)
+                attempt_cmd = list(cmd)
+                attempt_cmd.extend(selected_runtime.compute_args)
+                if language is not None:
+                    attempt_cmd.extend(["-l", language])
+                timeout_s = self._compute_transcribe_timeout_s(
+                    audio_seconds=duration_s,
+                    compute=selected_runtime.requested_compute,
+                    asr_preset=request.asr_preset,
                 )
+                try:
+                    result = self._run_fn(
+                        attempt_cmd,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=timeout_s,
+                    )
+                    if result.returncode != 0:
+                        raise EngineUnavailableError(
+                            "whisper.cpp transcription failed: "
+                            f"{(result.stderr or result.stdout).strip()}"
+                        )
+                    break
+                except subprocess.TimeoutExpired as exc:
+                    if attempt_idx == 0:
+                        logger.warning(
+                            "whisper.cpp timed out after %.1fs on %s; retrying once on %s.",
+                            timeout_s,
+                            runtime.requested_compute,
+                            retry_runtime.requested_compute,
+                        )
+                        continue
+                    raise EngineUnavailableError(
+                        "whisper.cpp transcription timed out after retry."
+                    ) from exc
+            if result is None:
+                raise EngineUnavailableError("whisper.cpp transcription did not produce a result.")
 
             text_output = output_base.with_suffix(".txt")
             if not text_output.exists():
@@ -109,7 +164,6 @@ class WhisperCppEngine:
             if not text:
                 return []
 
-            duration_s = len(request.pcm_bytes) / 2.0 / request.sample_rate_hz
             return [
                 TranscriptSegment(
                     text=text,
@@ -119,6 +173,36 @@ class WhisperCppEngine:
                     is_final=True,
                 )
             ]
+
+    @classmethod
+    def _compute_transcribe_timeout_s(
+        cls,
+        *,
+        audio_seconds: float,
+        compute: str,
+        asr_preset: str,
+    ) -> float:
+        normalized_compute = compute.strip().lower()
+        normalized_preset = asr_preset.strip().lower()
+        if normalized_compute == "cpu":
+            factor = _WHISPER_CPP_TIMEOUT_PER_AUDIO_SECOND_CPU.get(
+                normalized_preset,
+                _WHISPER_CPP_TIMEOUT_PER_AUDIO_SECOND_CPU["balanced"],
+            )
+            raw_timeout_s = cls._TRANSCRIBE_TIMEOUT_BASE_CPU_S + (max(0.0, audio_seconds) * factor)
+            return min(
+                cls._TRANSCRIBE_TIMEOUT_MAX_CPU_S,
+                max(cls._TRANSCRIBE_TIMEOUT_MIN_S, raw_timeout_s),
+            )
+        factor = _WHISPER_CPP_TIMEOUT_PER_AUDIO_SECOND_GPU.get(
+            normalized_preset,
+            _WHISPER_CPP_TIMEOUT_PER_AUDIO_SECOND_GPU["balanced"],
+        )
+        raw_timeout_s = cls._TRANSCRIBE_TIMEOUT_BASE_GPU_S + (max(0.0, audio_seconds) * factor)
+        return min(
+            cls._TRANSCRIBE_TIMEOUT_MAX_GPU_S,
+            max(cls._TRANSCRIBE_TIMEOUT_MIN_S, raw_timeout_s),
+        )
 
     @classmethod
     def clear_cache_for_tests(cls) -> None:
