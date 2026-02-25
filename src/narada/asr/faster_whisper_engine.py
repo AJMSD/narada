@@ -22,6 +22,8 @@ from narada.asr.model_discovery import resolve_faster_whisper_model_path
 
 logger = logging.getLogger("narada.asr.faster_whisper")
 ModelFactory = Callable[[str, str, str], Any]
+_WINDOWS_CTRL_HANDLER_REF: Any | None = None
+_WORKER_BOOTSTRAP_ENV_VAR = "NARADA_FASTER_WHISPER_WORKER_BOOTSTRAP"
 
 
 class _GpuWorkerError(RuntimeError):
@@ -175,6 +177,63 @@ def _call_model_transcribe(
     return cast(Sequence[Any], segments_iter)
 
 
+def _suppress_windows_console_ctrl_events() -> None:
+    global _WINDOWS_CTRL_HANDLER_REF
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return
+        kernel32 = getattr(windll, "kernel32", None)
+        if kernel32 is None:
+            return
+        handler_factory = getattr(ctypes, "WINFUNCTYPE", None)
+        if handler_factory is None:
+            return
+
+        handler_type = handler_factory(ctypes.c_bool, ctypes.c_uint)
+
+        def _ctrl_handler(_ctrl_type: int) -> bool:
+            return True
+
+        handler = handler_type(_ctrl_handler)
+        if int(kernel32.SetConsoleCtrlHandler(handler, True)) != 0:
+            # Keep a module-level reference so the callback remains alive.
+            _WINDOWS_CTRL_HANDLER_REF = handler
+    except Exception:
+        return
+
+
+def _ignore_console_interrupt_signals() -> None:
+    if hasattr(signal, "SIGINT"):
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (OSError, RuntimeError, ValueError):
+            pass
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+
+def _apply_worker_bootstrap_signal_hardening() -> None:
+    if os.environ.get(_WORKER_BOOTSTRAP_ENV_VAR, "").strip() != "1":
+        return
+    try:
+        _suppress_windows_console_ctrl_events()
+        _ignore_console_interrupt_signals()
+    except Exception:
+        return
+
+
+# Best-effort early hardening for spawned worker bootstrap on Windows.
+_apply_worker_bootstrap_signal_hardening()
+
+
 def _gpu_transcribe_worker_main(
     request_queue: Any,
     response_queue: Any,
@@ -182,11 +241,11 @@ def _gpu_transcribe_worker_main(
     device: str,
     compute_type: str,
 ) -> None:
-    if hasattr(signal, "SIGINT"):
-        try:
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except (OSError, RuntimeError, ValueError):
-            pass
+    try:
+        _suppress_windows_console_ctrl_events()
+    except Exception:
+        pass
+    _ignore_console_interrupt_signals()
     try:
         from faster_whisper import WhisperModel
 
@@ -588,7 +647,15 @@ class FasterWhisperEngine:
             daemon=True,
             name=self._worker_process_name(key[1]),
         )
-        process.start()
+        prior_bootstrap_flag = os.environ.get(_WORKER_BOOTSTRAP_ENV_VAR)
+        os.environ[_WORKER_BOOTSTRAP_ENV_VAR] = "1"
+        try:
+            process.start()
+        finally:
+            if prior_bootstrap_flag is None:
+                os.environ.pop(_WORKER_BOOTSTRAP_ENV_VAR, None)
+            else:
+                os.environ[_WORKER_BOOTSTRAP_ENV_VAR] = prior_bootstrap_flag
 
         startup_timeout_s = self._worker_startup_timeout_s(device=key[1])
         try:
