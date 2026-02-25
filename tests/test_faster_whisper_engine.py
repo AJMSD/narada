@@ -14,6 +14,7 @@ from narada.asr.faster_whisper_engine import (
     _GpuWorkerHandle,
     _GpuWorkerRuntimeError,
     _GpuWorkerTimeoutError,
+    _suppress_worker_stderr_on_windows,
 )
 
 
@@ -655,7 +656,7 @@ def test_gpu_worker_main_exits_cleanly_when_queue_get_is_interrupted(
     assert response_queue.items[0].get("kind") == "ready"
 
 
-def test_gpu_worker_main_invokes_windows_console_ctrl_suppression(
+def test_gpu_worker_main_invokes_worker_stderr_and_console_ctrl_suppression(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_fw_module = types.ModuleType("faster_whisper")
@@ -680,14 +681,18 @@ def test_gpu_worker_main_invokes_windows_console_ctrl_suppression(
         def put(self, item: dict[str, object]) -> None:
             self.items.append(item)
 
-    suppression_calls = {"count": 0}
+    suppression_calls = {"ctrl": 0, "stderr": 0}
 
     def _record_suppression() -> None:
-        suppression_calls["count"] += 1
+        suppression_calls["ctrl"] += 1
 
     monkeypatch.setattr(
         "narada.asr.faster_whisper_engine._suppress_windows_console_ctrl_events",
         _record_suppression,
+    )
+    monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine._suppress_worker_stderr_on_windows",
+        lambda: suppression_calls.__setitem__("stderr", suppression_calls["stderr"] + 1),
     )
     fake_fw_module.WhisperModel = _FakeWhisperModel
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw_module)
@@ -701,7 +706,8 @@ def test_gpu_worker_main_invokes_windows_console_ctrl_suppression(
         "int8",
     )
 
-    assert suppression_calls["count"] == 1
+    assert suppression_calls["ctrl"] == 1
+    assert suppression_calls["stderr"] == 1
     assert response_queue.items
     assert response_queue.items[0].get("kind") == "ready"
 
@@ -735,6 +741,10 @@ def test_gpu_worker_main_swallows_windows_console_ctrl_suppression_errors(
         "narada.asr.faster_whisper_engine._suppress_windows_console_ctrl_events",
         lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
+    monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine._suppress_worker_stderr_on_windows",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom stderr")),
+    )
     fake_fw_module.WhisperModel = _FakeWhisperModel
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw_module)
     response_queue = _ResponseQueue()
@@ -754,14 +764,18 @@ def test_gpu_worker_main_swallows_windows_console_ctrl_suppression_errors(
 def test_worker_bootstrap_signal_hardening_runs_when_env_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    suppression_calls = {"count": 0}
+    suppression_calls = {"ctrl": 0, "stderr": 0}
     signal_calls: list[int] = []
 
     monkeypatch.setenv(_WORKER_BOOTSTRAP_ENV_VAR, "1")
     monkeypatch.setattr("narada.asr.faster_whisper_engine.os.name", "nt")
     monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine._suppress_worker_stderr_on_windows",
+        lambda: suppression_calls.__setitem__("stderr", suppression_calls["stderr"] + 1),
+    )
+    monkeypatch.setattr(
         "narada.asr.faster_whisper_engine._suppress_windows_console_ctrl_events",
-        lambda: suppression_calls.__setitem__("count", suppression_calls["count"] + 1),
+        lambda: suppression_calls.__setitem__("ctrl", suppression_calls["ctrl"] + 1),
     )
     monkeypatch.setattr(
         "narada.asr.faster_whisper_engine.signal.signal",
@@ -770,7 +784,8 @@ def test_worker_bootstrap_signal_hardening_runs_when_env_enabled(
 
     _apply_worker_bootstrap_signal_hardening()
 
-    assert suppression_calls["count"] == 1
+    assert suppression_calls["ctrl"] == 1
+    assert suppression_calls["stderr"] == 1
     assert signal_calls
 
 
@@ -780,11 +795,22 @@ def test_worker_bootstrap_signal_hardening_swallows_failures(
     monkeypatch.setenv(_WORKER_BOOTSTRAP_ENV_VAR, "1")
     monkeypatch.setattr("narada.asr.faster_whisper_engine.os.name", "nt")
     monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine._suppress_worker_stderr_on_windows",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom stderr")),
+    )
+    monkeypatch.setattr(
         "narada.asr.faster_whisper_engine._suppress_windows_console_ctrl_events",
         lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
 
     _apply_worker_bootstrap_signal_hardening()
+
+
+def test_suppress_worker_stderr_on_windows_noops_on_non_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("narada.asr.faster_whisper_engine.os.name", "posix")
+    _suppress_worker_stderr_on_windows()
 
 
 def test_worker_process_name_includes_device() -> None:
