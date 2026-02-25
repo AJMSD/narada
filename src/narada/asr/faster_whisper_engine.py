@@ -7,6 +7,7 @@ import os
 import platform
 import queue
 import signal
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib.util import find_spec
@@ -23,6 +24,7 @@ from narada.asr.model_discovery import resolve_faster_whisper_model_path
 logger = logging.getLogger("narada.asr.faster_whisper")
 ModelFactory = Callable[[str, str, str], Any]
 _WINDOWS_CTRL_HANDLER_REF: Any | None = None
+_WORKER_STDERR_STREAM: Any | None = None
 _WORKER_BOOTSTRAP_ENV_VAR = "NARADA_FASTER_WHISPER_WORKER_BOOTSTRAP"
 
 
@@ -190,6 +192,12 @@ def _suppress_windows_console_ctrl_events() -> None:
         kernel32 = getattr(windll, "kernel32", None)
         if kernel32 is None:
             return
+        set_console_ctrl_handler = getattr(kernel32, "SetConsoleCtrlHandler", None)
+        if set_console_ctrl_handler is None:
+            return
+        # Attempt process-wide ignore first so child runtimes do not receive Ctrl events.
+        if int(set_console_ctrl_handler(None, True)) != 0:
+            return
         handler_factory = getattr(ctypes, "WINFUNCTYPE", None)
         if handler_factory is None:
             return
@@ -200,9 +208,27 @@ def _suppress_windows_console_ctrl_events() -> None:
             return True
 
         handler = handler_type(_ctrl_handler)
-        if int(kernel32.SetConsoleCtrlHandler(handler, True)) != 0:
+        if int(set_console_ctrl_handler(handler, True)) != 0:
             # Keep a module-level reference so the callback remains alive.
             _WINDOWS_CTRL_HANDLER_REF = handler
+    except Exception:
+        return
+
+
+def _suppress_worker_stderr_on_windows() -> None:
+    global _WORKER_STDERR_STREAM
+    if os.name != "nt":
+        return
+    if _WORKER_STDERR_STREAM is not None:
+        return
+    try:
+        worker_stderr = open(os.devnull, "w")
+        os.dup2(worker_stderr.fileno(), 2)
+        try:
+            sys.stderr = worker_stderr
+        except Exception:
+            pass
+        _WORKER_STDERR_STREAM = worker_stderr
     except Exception:
         return
 
@@ -224,6 +250,7 @@ def _apply_worker_bootstrap_signal_hardening() -> None:
     if os.environ.get(_WORKER_BOOTSTRAP_ENV_VAR, "").strip() != "1":
         return
     try:
+        _suppress_worker_stderr_on_windows()
         _suppress_windows_console_ctrl_events()
         _ignore_console_interrupt_signals()
     except Exception:
@@ -241,6 +268,10 @@ def _gpu_transcribe_worker_main(
     device: str,
     compute_type: str,
 ) -> None:
+    try:
+        _suppress_worker_stderr_on_windows()
+    except Exception:
+        pass
     try:
         _suppress_windows_console_ctrl_events()
     except Exception:
