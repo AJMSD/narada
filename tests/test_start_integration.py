@@ -434,6 +434,107 @@ def test_start_interrupt_displays_asr_shutdown_notice(
     assert "shutdown notice transcript" in out_path.read_text(encoding="utf-8")
 
 
+def test_start_shutdown_queue_full_keeps_final_tail_bounded(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    out_path = tmp_path / "bounded-final-tail.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("bounded tail transcript", delay_s=0.03)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(160)])
+    captured_tail_seconds: dict[str, list[float]] = {"values": []}
+
+    from narada.live_notes import IntervalPlanner as RealIntervalPlanner
+
+    class _RecordingPlanner(RealIntervalPlanner):
+        def build_final_tasks(self, *, now_monotonic: float | None = None) -> list[Any]:
+            tasks = super().build_final_tasks(now_monotonic=now_monotonic)
+            captured_tail_seconds["values"] = [
+                task.audio_seconds for task in tasks if task.label == "final-tail"
+            ]
+            return tasks
+
+    def _planner_factory(*args: object, **kwargs: object) -> RealIntervalPlanner:
+        return _RecordingPlanner(*args, **kwargs)
+
+    monkeypatch.setattr("narada.cli.IntervalPlanner", _planner_factory)
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=4))
+
+    _run_start_for_tests()
+
+    assert captured_tail_seconds["values"]
+    assert max(captured_tail_seconds["values"]) <= 1.0
+    assert "bounded tail transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_shutdown_ignores_repeated_ctrl_c_during_drain(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    out_path = tmp_path / "repeated-ctrlc-drain.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("repeated ctrlc transcript", delay_s=0.02)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(64)])
+    state = {"calls": 0}
+
+    def _sleep_with_repeated_interrupts(_seconds: float) -> None:
+        state["calls"] += 1
+        if state["calls"] in {3, 4}:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _sleep_with_repeated_interrupts)
+
+    _run_start_for_tests()
+
+    assert state["calls"] >= 4
+    assert "repeated ctrlc transcript" in out_path.read_text(encoding="utf-8")
+
+
 def test_start_falls_back_to_recommended_engine(monkeypatch: Any, tmp_path: Path) -> None:
     out_path = tmp_path / "fallback.txt"
     cfg = _runtime_config("mic", out_path)

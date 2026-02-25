@@ -7,6 +7,7 @@ import pytest
 from narada.cli import (
     _build_live_status_lines,
     _estimate_asr_backlog_seconds,
+    _estimate_asr_remaining_seconds,
     _estimate_capture_backlog_seconds,
     _estimate_shutdown_eta_seconds,
     _maybe_warn_asr_backlog,
@@ -158,6 +159,14 @@ def test_estimate_asr_backlog_seconds_combines_planner_and_queue() -> None:
         interval_s=12.0,
     )
     assert backlog == pytest.approx(29.0)
+
+
+def test_estimate_asr_remaining_seconds_combines_planner_and_pending_audio() -> None:
+    backlog = _estimate_asr_remaining_seconds(
+        planner_backlog_s=8.5,
+        pending_asr_audio_s=11.5,
+    )
+    assert backlog == pytest.approx(20.0)
 
 
 def test_maybe_warn_asr_backlog_warns_and_throttles(monkeypatch: pytest.MonkeyPatch) -> None:
