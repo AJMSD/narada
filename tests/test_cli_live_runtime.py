@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import queue
+from collections import deque
 from pathlib import Path
 
 import pytest
 
+from narada.audio.capture import CapturedFrame
 from narada.cli import (
     _build_live_status_lines,
+    _drain_capture_queue_to_pending,
     _estimate_asr_backlog_seconds,
     _estimate_asr_remaining_seconds,
     _estimate_capture_backlog_seconds,
     _estimate_shutdown_eta_seconds,
     _maybe_warn_asr_backlog,
     _maybe_warn_capture_backlog,
+    _ShutdownSignalController,
 )
 from narada.config import RuntimeConfig
 from narada.performance import RuntimePerformance
@@ -89,6 +94,27 @@ def test_estimate_capture_backlog_seconds_handles_invalid_values() -> None:
         )
         == 0
     )
+
+
+def test_drain_capture_queue_to_pending_respects_max_items_and_order() -> None:
+    source: queue.Queue[CapturedFrame] = queue.Queue()
+    first = CapturedFrame(pcm_bytes=b"a", sample_rate_hz=16000, channels=1)
+    second = CapturedFrame(pcm_bytes=b"b", sample_rate_hz=16000, channels=1)
+    third = CapturedFrame(pcm_bytes=b"c", sample_rate_hz=16000, channels=1)
+    source.put(first)
+    source.put(second)
+    source.put(third)
+    pending: deque[CapturedFrame] = deque()
+
+    drained = _drain_capture_queue_to_pending(
+        source_queue=source,
+        target_pending=pending,
+        max_items=2,
+    )
+
+    assert drained == 2
+    assert [frame.pcm_bytes for frame in pending] == [b"a", b"b"]
+    assert source.qsize() == 1
 
 
 def test_maybe_warn_capture_backlog_warns_and_throttles(
@@ -231,3 +257,26 @@ def test_build_live_status_lines_includes_warning_and_shutdown() -> None:
     assert "Warning: ASR backlog is 9.7s." in lines[2]
     assert "Application stopping. ASR completing first." in lines[3]
     assert "Will stop in about ~4.8s" in lines[3]
+
+
+def test_shutdown_signal_controller_forces_exit_on_second_signal() -> None:
+    controller = _ShutdownSignalController()
+    controller.note_signal(signal_kind="sigint")
+    assert not controller.force_exit_requested
+    assert controller.shutdown_reason == "Ctrl+C"
+
+    controller.note_signal(signal_kind="sigint")
+    assert controller.force_exit_requested
+    assert controller.force_exit_code == 130
+
+
+def test_shutdown_signal_controller_prefers_sigterm_exit_code_when_sigterm_first() -> None:
+    controller = _ShutdownSignalController()
+    controller.note_signal(signal_kind="sigterm")
+    controller.note_keyboard_interrupt()
+    assert controller.interrupt_count == 1
+    assert controller.shutdown_reason == "SIGTERM"
+
+    controller.note_keyboard_interrupt()
+    assert controller.force_exit_requested
+    assert controller.force_exit_code == 143

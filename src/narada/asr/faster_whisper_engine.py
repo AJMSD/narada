@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import platform
 import queue
+import signal
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib.util import find_spec
@@ -66,6 +67,12 @@ _GPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET: dict[str, float] = {
     "fast": 0.30,
     "balanced": 0.55,
     "accurate": 0.75,
+}
+
+_CPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET: dict[str, float] = {
+    "fast": 1.00,
+    "balanced": 1.80,
+    "accurate": 2.60,
 }
 
 
@@ -175,6 +182,11 @@ def _gpu_transcribe_worker_main(
     device: str,
     compute_type: str,
 ) -> None:
+    if hasattr(signal, "SIGINT"):
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (OSError, RuntimeError, ValueError):
+            pass
     try:
         from faster_whisper import WhisperModel
 
@@ -190,7 +202,12 @@ def _gpu_transcribe_worker_main(
         return
 
     while True:
-        request = request_queue.get()
+        try:
+            request = request_queue.get()
+        except (KeyboardInterrupt, EOFError, OSError):
+            return
+        except Exception:
+            return
         if not isinstance(request, dict):
             continue
         kind = request.get("kind")
@@ -272,6 +289,11 @@ class FasterWhisperEngine:
     _GPU_TRANSCRIBE_TIMEOUT_S: ClassVar[float] = 12.0
     _GPU_TRANSCRIBE_TIMEOUT_BASE_S: ClassVar[float] = 8.0
     _GPU_TRANSCRIBE_TIMEOUT_MAX_S: ClassVar[float] = 90.0
+    _CPU_STARTUP_TIMEOUT_S: ClassVar[float] = 45.0
+    _CPU_PROBE_TIMEOUT_S: ClassVar[float] = 10.0
+    _CPU_TRANSCRIBE_TIMEOUT_S: ClassVar[float] = 20.0
+    _CPU_TRANSCRIBE_TIMEOUT_BASE_S: ClassVar[float] = 30.0
+    _CPU_TRANSCRIBE_TIMEOUT_MAX_S: ClassVar[float] = 1800.0
     _GPU_LONG_WINDOW_THRESHOLD_S: ClassVar[float] = 120.0
     _GPU_LONG_WINDOW_CHUNK_S: ClassVar[float] = 60.0
     _GPU_LONG_WINDOW_OVERLAP_S: ClassVar[float] = 1.5
@@ -286,6 +308,7 @@ class FasterWhisperEngine:
         self._model_factory = model_factory or self._default_model_factory
         self._availability_probe = availability_probe or self._default_availability_probe
         self._model_directory = model_directory
+        self._use_guarded_cpu_worker = model_factory is None
         self._gpu_worker: _GpuWorkerHandle | None = None
         self._gpu_probe_complete = False
         self._gpu_disabled_reason: str | None = None
@@ -317,7 +340,7 @@ class FasterWhisperEngine:
         model_reference = self._resolve_model_reference(request.model)
         device, compute_type = self.resolve_compute_backend(request.compute)
 
-        if device in {"auto", "cuda"}:
+        if device == "cuda":
             guarded = self._transcribe_with_gpu_guard(
                 request=request,
                 model_reference=model_reference,
@@ -332,6 +355,38 @@ class FasterWhisperEngine:
             if guarded is not None:
                 return guarded
             device, compute_type = "cpu", "int8"
+            if self._use_guarded_cpu_worker:
+                guarded_cpu = self._transcribe_with_gpu_guard(
+                    request=request,
+                    model_reference=model_reference,
+                    device=device,
+                    compute_type=compute_type,
+                    source_audio=source_audio,
+                    source_rate_hz=request.sample_rate_hz,
+                    language=language,
+                    multilingual=multilingual,
+                    asr_preset=request.asr_preset,
+                )
+                if guarded_cpu is not None:
+                    return guarded_cpu
+                raise EngineUnavailableError(
+                    "faster-whisper cpu/int8 guarded worker failed while handling GPU fallback."
+                )
+        elif device == "cpu" and self._use_guarded_cpu_worker:
+            guarded = self._transcribe_with_gpu_guard(
+                request=request,
+                model_reference=model_reference,
+                device=device,
+                compute_type=compute_type,
+                source_audio=source_audio,
+                source_rate_hz=request.sample_rate_hz,
+                language=language,
+                multilingual=multilingual,
+                asr_preset=request.asr_preset,
+            )
+            if guarded is not None:
+                return guarded
+            raise EngineUnavailableError("faster-whisper cpu/int8 guarded worker failed.")
 
         return self._transcribe_in_process(
             request=request,
@@ -358,7 +413,7 @@ class FasterWhisperEngine:
         multilingual: bool,
         asr_preset: str,
     ) -> list[TranscriptSegment] | None:
-        if self._gpu_disabled_reason is not None:
+        if device in {"auto", "cuda"} and self._gpu_disabled_reason is not None:
             return None
 
         max_attempts = max(1, self._GPU_TRANSCRIBE_MAX_ATTEMPTS)
@@ -380,20 +435,24 @@ class FasterWhisperEngine:
                 last_retryable_error = exc
                 if attempt_idx + 1 < max_attempts:
                     logger.warning(
-                        "GPU worker request failed (%s); retrying (%d/%d).",
+                        "ASR worker request failed (%s); retrying (%d/%d).",
                         exc,
                         attempt_idx + 1,
                         max_attempts,
                     )
                     continue
-                self._disable_gpu_for_session(
-                    reason=str(exc),
-                    device=device,
-                    compute_type=compute_type,
-                )
-                return None
+                if device in {"auto", "cuda"}:
+                    self._disable_gpu_for_session(
+                        reason=str(exc),
+                        device=device,
+                        compute_type=compute_type,
+                    )
+                    return None
+                raise EngineUnavailableError(
+                    f"faster-whisper CPU worker failed after retry: {exc}"
+                ) from exc
             except _GpuWorkerRuntimeError as exc:
-                if self._should_retry_on_cpu(
+                if device in {"auto", "cuda"} and self._should_retry_on_cpu(
                     exc,
                     device=device,
                 ):
@@ -412,12 +471,16 @@ class FasterWhisperEngine:
                 ) from exc
 
         if last_retryable_error is not None:
-            self._disable_gpu_for_session(
-                reason=str(last_retryable_error),
-                device=device,
-                compute_type=compute_type,
-            )
-            return None
+            if device in {"auto", "cuda"}:
+                self._disable_gpu_for_session(
+                    reason=str(last_retryable_error),
+                    device=device,
+                    compute_type=compute_type,
+                )
+                return None
+            raise EngineUnavailableError(
+                f"faster-whisper CPU worker failed after retry: {last_retryable_error}"
+            ) from last_retryable_error
         return None
 
     def _transcribe_gpu_guarded(
@@ -437,13 +500,16 @@ class FasterWhisperEngine:
         if not self._gpu_probe_complete:
             probe_samples = max(worker.sample_rate_hz // 4, 4000)
             probe_audio = np.zeros(probe_samples, dtype=np.float32)
+            probe_timeout_s = (
+                self._GPU_PROBE_TIMEOUT_S if device == "cuda" else self._CPU_PROBE_TIMEOUT_S
+            )
             self._run_gpu_worker_request(
                 worker=worker,
                 audio=probe_audio,
                 language="en",
                 multilingual=False,
                 asr_preset="fast",
-                timeout_s=self._GPU_PROBE_TIMEOUT_S,
+                timeout_s=probe_timeout_s,
                 probe=True,
             )
             self._gpu_probe_complete = True
@@ -457,7 +523,7 @@ class FasterWhisperEngine:
             sample_count=worker_audio.shape[0],
             sample_rate_hz=worker.sample_rate_hz,
         )
-        if self._should_chunk_gpu_audio(audio_seconds=audio_seconds):
+        if device == "cuda" and self._should_chunk_gpu_audio(audio_seconds=audio_seconds):
             merged: list[dict[str, Any]] = []
             for chunk_audio, chunk_offset_s in self._iter_gpu_audio_chunks(
                 audio=worker_audio,
@@ -467,7 +533,8 @@ class FasterWhisperEngine:
                     sample_count=chunk_audio.shape[0],
                     sample_rate_hz=worker.sample_rate_hz,
                 )
-                chunk_timeout_s = self._compute_gpu_transcribe_timeout_s(
+                chunk_timeout_s = self._compute_worker_transcribe_timeout_s(
+                    device=device,
                     audio_seconds=chunk_seconds,
                     asr_preset=asr_preset,
                 )
@@ -488,7 +555,8 @@ class FasterWhisperEngine:
                 )
             return merged
 
-        timeout_s = self._compute_gpu_transcribe_timeout_s(
+        timeout_s = self._compute_worker_transcribe_timeout_s(
+            device=device,
             audio_seconds=audio_seconds,
             asr_preset=asr_preset,
         )
@@ -518,21 +586,22 @@ class FasterWhisperEngine:
             target=_gpu_transcribe_worker_main,
             args=(request_queue, response_queue, key[0], key[1], key[2]),
             daemon=True,
-            name="narada-faster-whisper-gpu",
+            name=self._worker_process_name(key[1]),
         )
         process.start()
 
+        startup_timeout_s = self._worker_startup_timeout_s(device=key[1])
         try:
-            ready = response_queue.get(timeout=self._GPU_STARTUP_TIMEOUT_S)
+            ready = response_queue.get(timeout=startup_timeout_s)
         except queue.Empty as exc:
             self._terminate_worker_process(process, request_queue, response_queue)
             raise _GpuWorkerTimeoutError(
-                "Timed out while starting faster-whisper GPU worker."
+                f"Timed out while starting faster-whisper {key[1]} ASR worker."
             ) from exc
 
         if not isinstance(ready, dict):
             self._terminate_worker_process(process, request_queue, response_queue)
-            raise _GpuWorkerRuntimeError("GPU worker returned an invalid startup response.")
+            raise _GpuWorkerRuntimeError("ASR worker returned an invalid startup response.")
 
         kind = str(ready.get("kind", ""))
         if kind == "startup_error":
@@ -541,12 +610,12 @@ class FasterWhisperEngine:
             raise _GpuWorkerRuntimeError(error)
         if kind != "ready":
             self._terminate_worker_process(process, request_queue, response_queue)
-            raise _GpuWorkerRuntimeError("GPU worker did not signal readiness.")
+            raise _GpuWorkerRuntimeError("ASR worker did not signal readiness.")
 
         sample_rate_hz = ready.get("sample_rate_hz")
         if not isinstance(sample_rate_hz, int) or sample_rate_hz <= 0:
             self._terminate_worker_process(process, request_queue, response_queue)
-            raise _GpuWorkerRuntimeError("GPU worker reported an invalid model sample rate.")
+            raise _GpuWorkerRuntimeError("ASR worker reported an invalid model sample rate.")
 
         worker = _GpuWorkerHandle(
             key=key,
@@ -585,7 +654,7 @@ class FasterWhisperEngine:
             worker.request_queue.put(request_payload)
         except Exception as exc:
             self._shutdown_gpu_worker()
-            raise _GpuWorkerExitError("GPU worker is unavailable.") from exc
+            raise _GpuWorkerExitError("ASR worker is unavailable.") from exc
 
         try:
             response = worker.response_queue.get(timeout=timeout_s)
@@ -594,17 +663,17 @@ class FasterWhisperEngine:
             self._shutdown_gpu_worker()
             if alive:
                 raise _GpuWorkerTimeoutError(
-                    f"GPU worker exceeded timeout ({timeout_s:.1f}s)."
+                    f"ASR worker exceeded timeout ({timeout_s:.1f}s)."
                 ) from exc
-            raise _GpuWorkerExitError("GPU worker exited before responding.") from exc
+            raise _GpuWorkerExitError("ASR worker exited before responding.") from exc
 
         if not isinstance(response, dict):
             self._shutdown_gpu_worker()
-            raise _GpuWorkerRuntimeError("GPU worker returned an invalid response.")
+            raise _GpuWorkerRuntimeError("ASR worker returned an invalid response.")
 
         if int(response.get("id", request_id)) != request_id:
             self._shutdown_gpu_worker()
-            raise _GpuWorkerRuntimeError("GPU worker response ID mismatch.")
+            raise _GpuWorkerRuntimeError("ASR worker response ID mismatch.")
 
         kind = str(response.get("kind", ""))
         if kind == "result":
@@ -613,11 +682,11 @@ class FasterWhisperEngine:
                 return [item for item in raw_segments if isinstance(item, dict)]
             return []
         if kind == "error":
-            message = str(response.get("error", "unknown GPU transcription error"))
+            message = str(response.get("error", "unknown ASR transcription error"))
             raise _GpuWorkerRuntimeError(message)
 
         self._shutdown_gpu_worker()
-        raise _GpuWorkerRuntimeError(f"Unexpected GPU worker response kind '{kind}'.")
+        raise _GpuWorkerRuntimeError(f"Unexpected ASR worker response kind '{kind}'.")
 
     def _shutdown_gpu_worker(self) -> None:
         worker = self._gpu_worker
@@ -746,16 +815,55 @@ class FasterWhisperEngine:
 
     @classmethod
     def _compute_gpu_transcribe_timeout_s(cls, *, audio_seconds: float, asr_preset: str) -> float:
+        return cls._compute_worker_transcribe_timeout_s(
+            device="cuda",
+            audio_seconds=audio_seconds,
+            asr_preset=asr_preset,
+        )
+
+    @classmethod
+    def _compute_worker_transcribe_timeout_s(
+        cls,
+        *,
+        device: str,
+        audio_seconds: float,
+        asr_preset: str,
+    ) -> float:
         normalized = asr_preset.strip().lower()
-        factor = _GPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET.get(
+        normalized_device = device.strip().lower()
+        if normalized_device == "cuda":
+            factor = _GPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET.get(
+                normalized,
+                _GPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET["balanced"],
+            )
+            raw_timeout_s = cls._GPU_TRANSCRIBE_TIMEOUT_BASE_S + (max(0.0, audio_seconds) * factor)
+            return min(
+                cls._GPU_TRANSCRIBE_TIMEOUT_MAX_S,
+                max(cls._GPU_TRANSCRIBE_TIMEOUT_S, raw_timeout_s),
+            )
+
+        factor = _CPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET.get(
             normalized,
-            _GPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET["balanced"],
+            _CPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET["balanced"],
         )
-        raw_timeout_s = cls._GPU_TRANSCRIBE_TIMEOUT_BASE_S + (max(0.0, audio_seconds) * factor)
+        raw_timeout_s = cls._CPU_TRANSCRIBE_TIMEOUT_BASE_S + (max(0.0, audio_seconds) * factor)
         return min(
-            cls._GPU_TRANSCRIBE_TIMEOUT_MAX_S,
-            max(cls._GPU_TRANSCRIBE_TIMEOUT_S, raw_timeout_s),
+            cls._CPU_TRANSCRIBE_TIMEOUT_MAX_S,
+            max(cls._CPU_TRANSCRIBE_TIMEOUT_S, raw_timeout_s),
         )
+
+    @classmethod
+    def _worker_startup_timeout_s(cls, *, device: str) -> float:
+        if device.strip().lower() == "cuda":
+            return cls._GPU_STARTUP_TIMEOUT_S
+        return cls._CPU_STARTUP_TIMEOUT_S
+
+    @staticmethod
+    def _worker_process_name(device: str) -> str:
+        normalized = device.strip().lower()
+        if normalized not in {"cuda", "cpu"}:
+            normalized = "worker"
+        return f"narada-faster-whisper-worker-{normalized}"
 
     @classmethod
     def _should_chunk_gpu_audio(cls, *, audio_seconds: float) -> bool:

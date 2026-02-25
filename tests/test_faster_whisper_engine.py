@@ -1,9 +1,15 @@
+import queue
+import sys
+import types
+
 import numpy as np
 import pytest
 
 from narada.asr.base import EngineUnavailableError, TranscriptionRequest
 from narada.asr.faster_whisper_engine import (
     FasterWhisperEngine,
+    _gpu_transcribe_worker_main,
+    _GpuWorkerHandle,
     _GpuWorkerRuntimeError,
     _GpuWorkerTimeoutError,
 )
@@ -486,6 +492,89 @@ def test_faster_whisper_gpu_timeout_policy_floor_scale_and_cap() -> None:
     assert capped_timeout == pytest.approx(90.0)
 
 
+def test_faster_whisper_cpu_timeout_policy_scale_and_cap() -> None:
+    floor_timeout = FasterWhisperEngine._compute_worker_transcribe_timeout_s(  # noqa: SLF001
+        device="cpu",
+        audio_seconds=0.0,
+        asr_preset="fast",
+    )
+    balanced_timeout = FasterWhisperEngine._compute_worker_transcribe_timeout_s(  # noqa: SLF001
+        device="cpu",
+        audio_seconds=20.0,
+        asr_preset="balanced",
+    )
+    accurate_timeout = FasterWhisperEngine._compute_worker_transcribe_timeout_s(  # noqa: SLF001
+        device="cpu",
+        audio_seconds=20.0,
+        asr_preset="accurate",
+    )
+    capped_timeout = FasterWhisperEngine._compute_worker_transcribe_timeout_s(  # noqa: SLF001
+        device="cpu",
+        audio_seconds=10_000.0,
+        asr_preset="accurate",
+    )
+
+    assert floor_timeout == pytest.approx(30.0)
+    assert balanced_timeout == pytest.approx(66.0)
+    assert accurate_timeout == pytest.approx(82.0)
+    assert capped_timeout == pytest.approx(1800.0)
+
+
+def test_faster_whisper_cpu_guarded_timeout_raises_engine_unavailable() -> None:
+    original_has_cuda = FasterWhisperEngine._has_cuda_device
+    FasterWhisperEngine._has_cuda_device = staticmethod(lambda: False)
+    try:
+        engine = FasterWhisperEngine(availability_probe=lambda: True)
+        attempts = {"count": 0}
+        original_guarded = engine._transcribe_gpu_guarded
+
+        def fake_guarded(**_kwargs: object) -> list[dict[str, object]]:
+            attempts["count"] += 1
+            raise _GpuWorkerTimeoutError("CPU worker exceeded timeout.")
+
+        engine._transcribe_gpu_guarded = fake_guarded  # type: ignore[method-assign]
+        request = TranscriptionRequest(
+            pcm_bytes=b"\x00\x00\x10\x00",
+            sample_rate_hz=16000,
+            languages=("en",),
+            model="small",
+            compute="cpu",
+        )
+        with pytest.raises(EngineUnavailableError):
+            engine.transcribe(request)
+        engine._transcribe_gpu_guarded = original_guarded  # type: ignore[method-assign]
+
+        assert attempts["count"] == 2
+    finally:
+        FasterWhisperEngine._has_cuda_device = original_has_cuda
+
+
+def test_faster_whisper_custom_model_factory_keeps_cpu_in_process_path() -> None:
+    FasterWhisperEngine.clear_cache_for_tests()
+    fake_model = _FakeModel(model_sample_rate_hz=16000)
+    engine = FasterWhisperEngine(
+        model_factory=lambda *_args: fake_model,
+        availability_probe=lambda: True,
+    )
+    original_guard = engine._transcribe_with_gpu_guard
+
+    def fail_guard(**_kwargs: object) -> list[dict[str, object]] | None:
+        raise AssertionError("guarded worker path should not run with custom model factory")
+
+    engine._transcribe_with_gpu_guard = fail_guard  # type: ignore[method-assign]
+    request = TranscriptionRequest(
+        pcm_bytes=b"\x00\x00\x10\x00",
+        sample_rate_hz=16000,
+        languages=("en",),
+        model="small",
+        compute="cpu",
+    )
+    result = engine.transcribe(request)
+    engine._transcribe_with_gpu_guard = original_guard  # type: ignore[method-assign]
+
+    assert result[0].text == "hello world"
+
+
 def test_faster_whisper_long_window_chunking_covers_all_audio_without_drop() -> None:
     sample_rate_hz = 16000
     # 125s should trigger long-window chunking.
@@ -521,3 +610,85 @@ def test_faster_whisper_compute_metal_on_macos_falls_back_to_cpu(
         lambda: "Darwin",
     )
     assert FasterWhisperEngine.resolve_compute_backend("metal") == ("cpu", "int8")
+
+
+def test_gpu_worker_main_exits_cleanly_when_queue_get_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_fw_module = types.ModuleType("faster_whisper")
+
+    class _FakeWhisperModel:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.feature_extractor = type("FeatureExtractor", (), {"sampling_rate": 16000})()
+
+        def transcribe(
+            self, *_args: object, **_kwargs: object
+        ) -> tuple[list[object], dict[str, object]]:
+            return ([], {})
+
+    class _InterruptingQueue:
+        def get(self) -> dict[str, object]:
+            raise KeyboardInterrupt
+
+    class _ResponseQueue:
+        def __init__(self) -> None:
+            self.items: list[dict[str, object]] = []
+
+        def put(self, item: dict[str, object]) -> None:
+            self.items.append(item)
+
+    fake_fw_module.WhisperModel = _FakeWhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw_module)
+    response_queue = _ResponseQueue()
+
+    _gpu_transcribe_worker_main(
+        _InterruptingQueue(),
+        response_queue,
+        "small",
+        "cpu",
+        "int8",
+    )
+
+    assert response_queue.items
+    assert response_queue.items[0].get("kind") == "ready"
+
+
+def test_worker_process_name_includes_device() -> None:
+    assert FasterWhisperEngine._worker_process_name("cpu") == "narada-faster-whisper-worker-cpu"  # noqa: SLF001
+    assert FasterWhisperEngine._worker_process_name("cuda") == "narada-faster-whisper-worker-cuda"  # noqa: SLF001
+
+
+def test_faster_whisper_guarded_timeout_uses_asr_worker_wording() -> None:
+    class _FakeProcess:
+        def is_alive(self) -> bool:
+            return True
+
+    class _FakeRequestQueue:
+        def put(self, _value: object) -> None:
+            return
+
+    class _FakeResponseQueue:
+        def get(self, *, timeout: float) -> object:
+            raise queue.Empty
+
+    engine = FasterWhisperEngine(
+        model_factory=lambda *_args: _FakeModel(),
+        availability_probe=lambda: True,
+    )
+    worker = _GpuWorkerHandle(
+        key=("small", "cpu", "int8"),
+        process=_FakeProcess(),  # type: ignore[arg-type]
+        request_queue=_FakeRequestQueue(),
+        response_queue=_FakeResponseQueue(),
+        sample_rate_hz=16000,
+    )
+    with pytest.raises(_GpuWorkerTimeoutError, match="ASR worker exceeded timeout"):
+        engine._run_gpu_worker_request(  # noqa: SLF001
+            worker=worker,
+            audio=np.zeros(1600, dtype=np.float32),
+            language=None,
+            multilingual=False,
+            asr_preset="balanced",
+            timeout_s=1.0,
+            probe=False,
+        )
