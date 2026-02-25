@@ -420,6 +420,62 @@ def test_notes_first_mixed_large_backlog_still_commits_during_runtime_cycle(
     assert "mixed backlog transcript" in out_path.read_text(encoding="utf-8")
 
 
+def test_start_mixed_shutdown_with_unbalanced_pending_frames_completes(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    out_path = tmp_path / "mixed-unbalanced-shutdown.txt"
+    cfg = _runtime_config(
+        "mixed",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("mixed unbalanced transcript", delay_s=0.01)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(24)])
+    system_capture = _FakeCapture(frames=[_frame() for _ in range(4)])
+    sleep_state = {"calls": 0, "interrupted": False}
+
+    def _sleep_with_single_interrupt(_seconds: float) -> None:
+        sleep_state["calls"] += 1
+        if not sleep_state["interrupted"] and sleep_state["calls"] >= 3:
+            sleep_state["interrupted"] = True
+            raise KeyboardInterrupt
+        if sleep_state["interrupted"] and sleep_state["calls"] > 80:
+            raise AssertionError("mixed-mode shutdown stalled with unbalanced pending frames")
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (
+            AudioDevice(1, "Mic", "input"),
+            AudioDevice(2, "Loopback", "loopback"),
+            [],
+        ),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.open_system_capture", lambda *_args, **_kwargs: system_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _sleep_with_single_interrupt)
+
+    _run_start_for_tests()
+
+    assert sleep_state["interrupted"]
+    assert "mixed unbalanced transcript" in out_path.read_text(encoding="utf-8")
+    assert mic_capture.closed
+    assert system_capture.closed
+
+
 def test_shutdown_drain_batches_progressively_with_large_pending_capture(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
@@ -585,9 +641,69 @@ def test_start_interrupt_displays_asr_shutdown_notice(
     _run_start_for_tests()
 
     captured = capsys.readouterr()
+    assert (
+        captured.err.count(
+            "Signal received. Stopping capture and draining ASR backlog to zero before exit."
+        )
+        == 1
+    )
     assert "Application stopping. ASR completing first." in captured.out
     assert "Will stop in about" in captured.out
     assert "shutdown notice transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_status_freezes_elapsed_and_includes_compact_drain_metrics(
+    monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_path = tmp_path / "paused-elapsed-status.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("paused elapsed transcript", delay_s=0.02)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(96)])
+    monotonic_state = {"value": 0.0}
+
+    def _fake_monotonic() -> float:
+        monotonic_state["value"] += 1.0
+        return monotonic_state["value"]
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.monotonic", _fake_monotonic)
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=4))
+
+    _run_start_for_tests()
+
+    captured = capsys.readouterr()
+    status_lines = [line for line in captured.out.splitlines() if line.startswith("REC ")]
+    assert status_lines
+    assert any("state=capturing" in line for line in status_lines)
+    paused_lines = [line for line in status_lines if "state=paused/draining" in line]
+    assert paused_lines
+    paused_elapsed = {line.split(" | ", 1)[0] for line in paused_lines}
+    assert len(paused_elapsed) == 1
+    assert all("taskq=" in line and "pend=" in line and "plan=" in line for line in paused_lines)
+    assert all("rtf=" in line and "asr=" in line for line in paused_lines)
+    assert "paused elapsed transcript" in out_path.read_text(encoding="utf-8")
 
 
 def test_start_sigterm_displays_sigterm_shutdown_reason(

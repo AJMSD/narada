@@ -14,6 +14,8 @@ from narada.cli import (
     _estimate_asr_remaining_seconds,
     _estimate_capture_backlog_seconds,
     _estimate_shutdown_eta_seconds,
+    _format_elapsed_seconds,
+    _LiveStatusRenderer,
     _maybe_warn_asr_backlog,
     _maybe_warn_capture_backlog,
     _ShutdownSignalController,
@@ -257,6 +259,68 @@ def test_build_live_status_lines_includes_warning_and_shutdown() -> None:
     assert "Warning: ASR backlog is 9.7s." in lines[2]
     assert "Application stopping. ASR completing first." in lines[3]
     assert "Will stop in about ~4.8s" in lines[3]
+
+
+def test_format_elapsed_seconds_converts_to_hh_mm_ss() -> None:
+    assert _format_elapsed_seconds(0.0) == "00:00:00"
+    assert _format_elapsed_seconds(65.2) == "00:01:05"
+    assert _format_elapsed_seconds(3661.8) == "01:01:01"
+    assert _format_elapsed_seconds(-12.0) == "00:00:00"
+
+
+def test_live_status_renderer_single_line_ansi_updates_and_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeStream:
+        def __init__(self) -> None:
+            self.output = ""
+
+        def isatty(self) -> bool:
+            return True
+
+        def write(self, text: str) -> int:
+            self.output += text
+            return len(text)
+
+        def flush(self) -> None:
+            return
+
+    stream = _FakeStream()
+    monkeypatch.setattr("narada.cli.sys.stdout", stream)
+    renderer = _LiveStatusRenderer()
+
+    renderer.render_single_line("first")
+    renderer.render_single_line("second")
+    renderer.break_single_line()
+    renderer.break_single_line()
+
+    assert "\r\x1b[2Kfirst" in stream.output
+    assert "\r\x1b[2Ksecond" in stream.output
+    assert stream.output.count("\n") == 1
+
+
+def test_live_status_renderer_single_line_falls_back_to_safe_echo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeStream:
+        def isatty(self) -> bool:
+            return False
+
+        def write(self, _text: str) -> int:
+            return 0
+
+        def flush(self) -> None:
+            return
+
+    echoed: list[str] = []
+    monkeypatch.setattr("narada.cli.sys.stdout", _FakeStream())
+    monkeypatch.setattr("narada.cli._safe_echo", lambda message, **_kwargs: echoed.append(message))
+
+    renderer = _LiveStatusRenderer()
+    renderer.render_single_line("fallback status")
+    renderer.break_single_line()
+
+    assert echoed == ["fallback status"]
 
 
 def test_shutdown_signal_controller_forces_exit_on_second_signal() -> None:
