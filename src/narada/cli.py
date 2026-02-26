@@ -771,21 +771,32 @@ def _run_tty_notes_first(
     total_asr_success_count = 0
     total_asr_error_count = 0
     total_asr_empty_count = 0
+    total_drained_audio_seconds = 0.0
     capture_stop_requested = False
     shutdown_drain_notice_emitted = False
     capture_clock_started_monotonic = time.monotonic()
     captured_elapsed_frozen_s: float | None = None
     capture_paused = False
+    drain_started = False
+    drain_start_backlog_s: float | None = None
+    committed_segments_at_drain_start: int = 0
+    asr_success_at_drain_start: int = 0
+    asr_error_at_drain_start: int = 0
+    asr_empty_at_drain_start: int = 0
+    drained_audio_at_drain_start_s: float = 0.0
+    forced_shutdown_summary_emitted = False
 
     def _apply_drain_summary(summary: _AsrDrainSummary) -> int:
         nonlocal pending_asr_audio_seconds
         nonlocal total_asr_success_count
         nonlocal total_asr_error_count
         nonlocal total_asr_empty_count
+        nonlocal total_drained_audio_seconds
         pending_asr_audio_seconds = max(
             0.0,
             pending_asr_audio_seconds - summary.completed_audio_seconds,
         )
+        total_drained_audio_seconds += max(0.0, summary.completed_audio_seconds)
         total_asr_success_count += summary.success_count
         total_asr_error_count += summary.error_count
         total_asr_empty_count += summary.empty_count
@@ -942,6 +953,49 @@ def _run_tty_notes_first(
         except (NotImplementedError, AttributeError):
             return 0
 
+    def _current_asr_backlog_seconds() -> float:
+        return _estimate_asr_remaining_seconds(
+            planner_backlog_s=planner.pending_backlog_seconds(),
+            pending_asr_audio_s=pending_asr_audio_seconds,
+        )
+
+    def _committed_delta_since_drain_start() -> int:
+        if not drain_started:
+            return 0
+        return max(0, performance.committed_segments - committed_segments_at_drain_start)
+
+    def _mark_drain_started() -> None:
+        nonlocal drain_started
+        nonlocal drain_start_backlog_s
+        nonlocal committed_segments_at_drain_start
+        nonlocal asr_success_at_drain_start
+        nonlocal asr_error_at_drain_start
+        nonlocal asr_empty_at_drain_start
+        nonlocal drained_audio_at_drain_start_s
+        if drain_started:
+            return
+        drain_started = True
+        drain_start_backlog_s = _current_asr_backlog_seconds()
+        committed_segments_at_drain_start = performance.committed_segments
+        asr_success_at_drain_start = total_asr_success_count
+        asr_error_at_drain_start = total_asr_error_count
+        asr_empty_at_drain_start = total_asr_empty_count
+        drained_audio_at_drain_start_s = total_drained_audio_seconds
+
+    def _emit_forced_shutdown_summary_once() -> None:
+        nonlocal forced_shutdown_summary_emitted
+        if forced_shutdown_summary_emitted:
+            return
+        _echo_runtime_event(
+            (
+                "Forced exit during drain: "
+                f"backlog_remaining={_current_asr_backlog_seconds():.1f}s "
+                f"committed_new={_committed_delta_since_drain_start()}"
+            ),
+            err=True,
+        )
+        forced_shutdown_summary_emitted = True
+
     def _render_live_status(
         *,
         asr_backlog_s: float,
@@ -1003,6 +1057,7 @@ def _run_tty_notes_first(
     def _raise_for_forced_shutdown_if_needed() -> None:
         if not shutdown_signals.force_exit_requested:
             return
+        _emit_forced_shutdown_summary_once()
         _echo_runtime_event(
             "Forced stop requested by second signal. Exiting before ASR backlog reaches zero.",
             err=True,
@@ -1033,9 +1088,10 @@ def _run_tty_notes_first(
 
     def _handle_interrupt() -> None:
         shutdown_signals.note_keyboard_interrupt()
-        _raise_for_forced_shutdown_if_needed()
+        _mark_drain_started()
         _stop_capture_sources()
         _emit_shutdown_drain_notice_once()
+        _raise_for_forced_shutdown_if_needed()
 
     try:
         if config.mode in {"mic", "mixed"} and mic_device is not None:
@@ -1272,10 +1328,7 @@ def _run_tty_notes_first(
 
         def _render_shutdown_status() -> None:
             now_monotonic = time.monotonic()
-            asr_backlog_s = _estimate_asr_remaining_seconds(
-                planner_backlog_s=planner.pending_backlog_seconds(),
-                pending_asr_audio_s=pending_asr_audio_seconds,
-            )
+            asr_backlog_s = _current_asr_backlog_seconds()
             performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
             _render_live_status(
                 asr_backlog_s=asr_backlog_s,
