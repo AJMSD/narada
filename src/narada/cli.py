@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -108,11 +108,13 @@ class _ShutdownSignalController:
         normalized = signal_kind.strip().lower()
         if normalized not in {"sigint", "sigterm"}:
             normalized = "sigint"
+        signal_delta_s = None
+        if self._last_signal_monotonic is not None:
+            signal_delta_s = now - self._last_signal_monotonic
         if (
             self._last_signal_kind == normalized
-            and self._last_signal_monotonic is not None
-            and now - self._last_signal_monotonic <= self._signal_dedupe_window_s
-            and self._pending_handler_interrupts > 0
+            and signal_delta_s is not None
+            and 0.0 <= signal_delta_s <= self._signal_dedupe_window_s
         ):
             return
         self._last_signal_kind = normalized
@@ -134,10 +136,13 @@ class _ShutdownSignalController:
         if self._pending_handler_interrupts > 0:
             self._pending_handler_interrupts -= 1
             return
+        signal_delta_s = None
+        if self._last_signal_monotonic is not None:
+            signal_delta_s = now - self._last_signal_monotonic
         if (
             self._last_signal_kind == "sigint"
-            and self._last_signal_monotonic is not None
-            and now - self._last_signal_monotonic <= self._signal_dedupe_window_s
+            and signal_delta_s is not None
+            and 0.0 <= signal_delta_s <= self._signal_dedupe_window_s
         ):
             return
         self.note_signal(signal_kind="sigint", now_monotonic=now)
@@ -774,6 +779,7 @@ def _run_tty_notes_first(
     total_drained_audio_seconds = 0.0
     capture_stop_requested = False
     shutdown_drain_notice_emitted = False
+    interrupt_transition_applied = False
     capture_clock_started_monotonic = time.monotonic()
     captured_elapsed_frozen_s: float | None = None
     capture_paused = False
@@ -1087,10 +1093,13 @@ def _run_tty_notes_first(
         shutdown_drain_notice_emitted = True
 
     def _handle_interrupt() -> None:
+        nonlocal interrupt_transition_applied
         shutdown_signals.note_keyboard_interrupt()
-        _mark_drain_started()
-        _stop_capture_sources()
-        _emit_shutdown_drain_notice_once()
+        if not interrupt_transition_applied:
+            _mark_drain_started()
+            _stop_capture_sources()
+            _emit_shutdown_drain_notice_once()
+            interrupt_transition_applied = True
         _raise_for_forced_shutdown_if_needed()
 
     try:
@@ -1313,6 +1322,21 @@ def _run_tty_notes_first(
         raise
     finally:
         finalization_started_at = time.perf_counter()
+        asr_shutdown_sentinel_enqueued = False
+
+        def _run_with_interrupt_retry(action: Callable[[], Any]) -> Any:
+            while True:
+                try:
+                    return action()
+                except KeyboardInterrupt:
+                    _handle_interrupt()
+                    continue
+
+        def _join_thread_with_interrupt_retry(thread: threading.Thread, *, timeout: float) -> None:
+            def _join_action() -> None:
+                thread.join(timeout=timeout)
+
+            _run_with_interrupt_retry(_join_action)
 
         def _drain_asr_results_for_shutdown() -> int:
             summary = _drain_asr_results(
@@ -1359,9 +1383,9 @@ def _run_tty_notes_first(
                     continue
 
         # Close handles first so blocking backend reads can unblock before joins.
-        _stop_capture_sources()
+        _run_with_interrupt_retry(_stop_capture_sources)
         for thread in capture_threads:
-            thread.join(timeout=1.0)
+            _join_thread_with_interrupt_retry(thread, timeout=1.0)
 
         mic_pending_final: deque[CapturedFrame] = deque()
         system_pending_final: deque[CapturedFrame] = deque()
@@ -1451,10 +1475,10 @@ def _run_tty_notes_first(
 
         _render_shutdown_status()
 
-        while True:
+        while not asr_shutdown_sentinel_enqueued:
             try:
                 asr_task_queue.put_nowait(None)
-                break
+                asr_shutdown_sentinel_enqueued = True
             except KeyboardInterrupt:
                 _handle_interrupt()
                 continue
@@ -1490,8 +1514,8 @@ def _run_tty_notes_first(
                 except KeyboardInterrupt:
                     _handle_interrupt()
                     continue
-            queue_join_thread.join(timeout=0.1)
-            asr_thread.join(timeout=1.0)
+            _join_thread_with_interrupt_retry(queue_join_thread, timeout=0.1)
+            _join_thread_with_interrupt_retry(asr_thread, timeout=1.0)
 
         while True:
             try:
@@ -1501,15 +1525,23 @@ def _run_tty_notes_first(
                 continue
             if drained_count <= 0:
                 break
-        performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=0.0)
-        _render_live_status(asr_backlog_s=0.0, include_shutdown_notice=True)
-        pending_live = live_gate_state.drain_pending(force_low_conf=True)
-        _write_committed_lines(
-            committed=cast(list[object], pending_live),
-            writer=writer,
-            config=config,
-            performance=performance,
-            started_at=time.perf_counter(),
+        _run_with_interrupt_retry(
+            lambda: performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=0.0)
+        )
+        _run_with_interrupt_retry(
+            lambda: _render_live_status(asr_backlog_s=0.0, include_shutdown_notice=True)
+        )
+        pending_live = _run_with_interrupt_retry(
+            lambda: live_gate_state.drain_pending(force_low_conf=True)
+        )
+        _run_with_interrupt_retry(
+            lambda: _write_committed_lines(
+                committed=cast(list[object], pending_live),
+                writer=writer,
+                config=config,
+                performance=performance,
+                started_at=time.perf_counter(),
+            )
         )
         if drain_started:
             drained_audio_delta = max(
@@ -1533,13 +1565,18 @@ def _run_tty_notes_first(
             )
             logger.warning(warning_message)
             _echo_runtime_event(warning_message, err=True)
-        performance.record_end_to_notes(
-            elapsed_seconds=time.perf_counter() - finalization_started_at
+        _run_with_interrupt_retry(
+            lambda: performance.record_end_to_notes(
+                elapsed_seconds=time.perf_counter() - finalization_started_at
+            )
         )
-        status_renderer.break_single_line()
+        _run_with_interrupt_retry(status_renderer.break_single_line)
 
         if spool is not None:
-            spool.cleanup(keep_files=spool_keep_files)
+            spool_for_cleanup = spool
+            _run_with_interrupt_retry(
+                lambda: spool_for_cleanup.cleanup(keep_files=spool_keep_files)
+            )
 
     return stopped_by_user
 
