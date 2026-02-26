@@ -446,7 +446,9 @@ def test_maybe_warn_asr_backlog_breaks_single_line_when_renderer_provided(
     assert warned
 
 
-def test_shutdown_signal_controller_dedupes_duplicate_signal_while_handler_interrupt_pending() -> None:
+def test_shutdown_signal_controller_dedupes_duplicate_signal_while_handler_interrupt_pending() -> (
+    None
+):
     controller = _ShutdownSignalController()
     controller.note_signal(signal_kind="sigint", now_monotonic=1.0)
     controller.note_signal(signal_kind="sigint", now_monotonic=1.2)
@@ -460,7 +462,9 @@ def test_shutdown_signal_controller_dedupes_duplicate_signal_while_handler_inter
     assert controller.force_exit_code == 130
 
 
-def test_shutdown_signal_controller_ignores_fallback_keyboard_interrupt_within_dedupe_window() -> None:
+def test_shutdown_signal_controller_ignores_fallback_keyboard_interrupt_within_dedupe_window() -> (
+    None
+):
     controller = _ShutdownSignalController()
     controller.note_signal(signal_kind="sigint", now_monotonic=10.0)
     controller.note_keyboard_interrupt(now_monotonic=10.1)

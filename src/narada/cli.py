@@ -1512,16 +1512,18 @@ def _run_tty_notes_first(
             started_at=time.perf_counter(),
         )
         if drain_started:
+            drained_audio_delta = max(
+                0.0,
+                total_drained_audio_seconds - drained_audio_at_drain_start_s,
+            )
             _echo_runtime_event(
-                (
-                    "Drain summary: "
-                    f"backlog_start={max(0.0, drain_start_backlog_s or 0.0):.1f}s "
-                    f"drained_audio={max(0.0, total_drained_audio_seconds - drained_audio_at_drain_start_s):.1f}s "
-                    f"asr_ok={max(0, total_asr_success_count - asr_success_at_drain_start)} "
-                    f"empty={max(0, total_asr_empty_count - asr_empty_at_drain_start)} "
-                    f"err={max(0, total_asr_error_count - asr_error_at_drain_start)} "
-                    f"committed_new={_committed_delta_since_drain_start()}"
-                )
+                "Drain summary: "
+                f"backlog_start={max(0.0, drain_start_backlog_s or 0.0):.1f}s "
+                f"drained_audio={drained_audio_delta:.1f}s "
+                f"asr_ok={max(0, total_asr_success_count - asr_success_at_drain_start)} "
+                f"empty={max(0, total_asr_empty_count - asr_empty_at_drain_start)} "
+                f"err={max(0, total_asr_error_count - asr_error_at_drain_start)} "
+                f"committed_new={_committed_delta_since_drain_start()}"
             )
         if performance.committed_segments <= 0 and total_asr_error_count > 0:
             warning_message = (
