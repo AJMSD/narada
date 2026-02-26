@@ -176,6 +176,8 @@ def _install_start_signal_handlers(
     handled_signals = [signal.SIGINT]
     if hasattr(signal, "SIGTERM"):
         handled_signals.append(signal.SIGTERM)
+    if hasattr(signal, "SIGBREAK"):
+        handled_signals.append(cast(signal.Signals, signal.SIGBREAK))
 
     for handled_signal in handled_signals:
         try:
@@ -778,6 +780,7 @@ def _run_tty_notes_first(
     total_asr_empty_count = 0
     total_drained_audio_seconds = 0.0
     capture_stop_requested = False
+    capture_sources_closed = False
     shutdown_drain_notice_emitted = False
     interrupt_transition_applied = False
     capture_clock_started_monotonic = time.monotonic()
@@ -1070,17 +1073,23 @@ def _run_tty_notes_first(
         )
         raise typer.Exit(code=shutdown_signals.force_exit_code or _SIGINT_EXIT_CODE)
 
-    def _stop_capture_sources() -> None:
+    def _request_capture_stop() -> None:
         nonlocal capture_stop_requested
         if capture_stop_requested:
             return
         _pause_capture_clock(now_monotonic=time.monotonic())
         capture_stop_requested = True
         capture_stop.set()
+
+    def _close_capture_sources() -> None:
+        nonlocal capture_sources_closed
+        if capture_sources_closed:
+            return
         if mic_capture is not None:
             mic_capture.close()
         if system_capture is not None:
             system_capture.close()
+        capture_sources_closed = True
 
     def _emit_shutdown_drain_notice_once() -> None:
         nonlocal shutdown_drain_notice_emitted
@@ -1097,7 +1106,7 @@ def _run_tty_notes_first(
         shutdown_signals.note_keyboard_interrupt()
         if not interrupt_transition_applied:
             _mark_drain_started()
-            _stop_capture_sources()
+            _request_capture_stop()
             _emit_shutdown_drain_notice_once()
             interrupt_transition_applied = True
         _raise_for_forced_shutdown_if_needed()
@@ -1382,10 +1391,20 @@ def _run_tty_notes_first(
                     _handle_interrupt()
                     continue
 
-        # Close handles first so blocking backend reads can unblock before joins.
-        _run_with_interrupt_retry(_stop_capture_sources)
+        _run_with_interrupt_retry(_request_capture_stop)
+        capture_threads_still_active = False
         for thread in capture_threads:
             _join_thread_with_interrupt_retry(thread, timeout=1.0)
+            if thread.is_alive():
+                capture_threads_still_active = True
+        if capture_threads_still_active:
+            _echo_runtime_event(
+                "Warning: capture worker remained active after stop request; "
+                "skipping immediate capture close to avoid unsafe native shutdown race.",
+                err=True,
+            )
+        else:
+            _run_with_interrupt_retry(_close_capture_sources)
 
         mic_pending_final: deque[CapturedFrame] = deque()
         system_pending_final: deque[CapturedFrame] = deque()
@@ -1565,6 +1584,8 @@ def _run_tty_notes_first(
             )
             logger.warning(warning_message)
             _echo_runtime_event(warning_message, err=True)
+        if not capture_sources_closed and not any(thread.is_alive() for thread in capture_threads):
+            _run_with_interrupt_retry(_close_capture_sources)
         _run_with_interrupt_retry(
             lambda: performance.record_end_to_notes(
                 elapsed_seconds=time.perf_counter() - finalization_started_at
