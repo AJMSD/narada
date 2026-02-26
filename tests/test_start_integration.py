@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -72,6 +72,39 @@ class _FailingCapture:
         raise self.error
 
     def close(self) -> None:
+        self.closed = True
+
+    def stats_snapshot(self) -> SimpleNamespace:
+        return SimpleNamespace(dropped_frames=0)
+
+
+@dataclass
+class _RaceDetectCapture:
+    frames: list[CapturedFrame]
+    sample_rate_hz: int = 16000
+    blocksize: int = 1600
+    read_delay_s: float = 0.05
+    closed: bool = False
+    close_during_read: bool = False
+    read_started: threading.Event = field(default_factory=threading.Event)
+    _read_lock: threading.Lock = field(default_factory=threading.Lock)
+    _read_in_progress: bool = False
+
+    def read_frame(self) -> CapturedFrame | None:
+        with self._read_lock:
+            self._read_in_progress = True
+        self.read_started.set()
+        threading.Event().wait(self.read_delay_s)
+        with self._read_lock:
+            self._read_in_progress = False
+        if not self.frames:
+            return None
+        return self.frames.pop(0)
+
+    def close(self) -> None:
+        with self._read_lock:
+            if self._read_in_progress:
+                self.close_during_read = True
         self.closed = True
 
     def stats_snapshot(self) -> SimpleNamespace:
@@ -724,6 +757,62 @@ def test_start_first_signal_before_first_status_render_emits_notice_once(
     assert "eta=~" in captured.out
     assert "Drain summary: " in captured.out
     assert "early interrupt transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_single_ctrl_c_does_not_close_capture_while_read_in_progress(
+    monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_path = tmp_path / "capture-read-race-safe-shutdown.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("race-safe transcript", delay_s=0.02)
+    mic_capture = _RaceDetectCapture(frames=[_frame() for _ in range(48)], read_delay_s=0.05)
+    state = {"raised": False}
+
+    def _sleep_interrupt_during_active_read(_seconds: float) -> None:
+        if not state["raised"] and mic_capture.read_started.is_set():
+            state["raised"] = True
+            raise KeyboardInterrupt
+        threading.Event().wait(0.001)
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _sleep_interrupt_during_active_read)
+
+    _run_start_for_tests()
+
+    captured = capsys.readouterr()
+    assert state["raised"]
+    assert (
+        captured.err.count(
+            "Signal received. Stopping capture and draining ASR backlog to zero before exit."
+        )
+        == 1
+    )
+    assert "Drain summary: " in captured.out
+    assert not mic_capture.close_during_read
+    assert mic_capture.closed
+    assert "race-safe transcript" in out_path.read_text(encoding="utf-8")
 
 
 def test_start_duplicate_sigint_signal_plus_keyboard_interrupt_still_drains(

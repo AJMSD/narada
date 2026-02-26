@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import queue
+import signal
+import threading
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -16,6 +20,7 @@ from narada.cli import (
     _estimate_shutdown_eta_seconds,
     _fit_status_line_to_terminal,
     _format_elapsed_seconds,
+    _install_start_signal_handlers,
     _LiveStatusRenderer,
     _maybe_warn_asr_backlog,
     _maybe_warn_capture_backlog,
@@ -485,3 +490,54 @@ def test_shutdown_signal_controller_prefers_sigterm_exit_code_when_sigterm_first
     controller.note_keyboard_interrupt(now_monotonic=20.8)
     assert controller.force_exit_requested
     assert controller.force_exit_code == 143
+
+
+def test_install_start_signal_handlers_registers_sigbreak_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _ShutdownSignalController()
+    fake_sigbreak = cast(signal.Signals, 1337)
+    registered: list[signal.Signals] = []
+
+    monkeypatch.setattr("narada.cli.threading.current_thread", lambda: threading.main_thread())
+    monkeypatch.setattr("narada.cli.signal.SIGBREAK", fake_sigbreak, raising=False)
+    monkeypatch.setattr("narada.cli.signal.getsignal", lambda _signum: signal.SIG_DFL)
+
+    def _record_registration(signum: signal.Signals, _handler: object) -> object:
+        registered.append(signum)
+        return signal.SIG_DFL
+
+    monkeypatch.setattr("narada.cli.signal.signal", _record_registration)
+
+    with _install_start_signal_handlers(controller):
+        pass
+
+    assert signal.SIGINT in registered
+    assert fake_sigbreak in registered
+
+
+def test_install_start_signal_handlers_maps_sigbreak_to_sigint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _ShutdownSignalController()
+    fake_sigbreak = cast(signal.Signals, 1338)
+    handlers: dict[signal.Signals, object] = {}
+
+    monkeypatch.setattr("narada.cli.threading.current_thread", lambda: threading.main_thread())
+    monkeypatch.setattr("narada.cli.signal.SIGBREAK", fake_sigbreak, raising=False)
+    monkeypatch.setattr("narada.cli.signal.getsignal", lambda _signum: signal.SIG_DFL)
+
+    def _capture_handler(signum: signal.Signals, handler: object) -> object:
+        handlers[signum] = handler
+        return signal.SIG_DFL
+
+    monkeypatch.setattr("narada.cli.signal.signal", _capture_handler)
+
+    with _install_start_signal_handlers(controller):
+        handler = handlers[fake_sigbreak]
+        with pytest.raises(KeyboardInterrupt):
+            cast(Callable[[int, object], None], handler)(int(fake_sigbreak), None)
+
+    assert controller.interrupt_count == 1
+    assert controller.first_signal_kind == "sigint"
+    assert controller.shutdown_reason == "Ctrl+C"
