@@ -99,11 +99,24 @@ class _ShutdownSignalController:
     force_exit_requested: bool = False
     force_exit_code: int | None = None
     _pending_handler_interrupts: int = 0
+    _signal_dedupe_window_s: float = 0.5
+    _last_signal_kind: str | None = None
+    _last_signal_monotonic: float | None = None
 
-    def note_signal(self, *, signal_kind: str) -> None:
+    def note_signal(self, *, signal_kind: str, now_monotonic: float | None = None) -> None:
+        now = now_monotonic if now_monotonic is not None else time.monotonic()
         normalized = signal_kind.strip().lower()
         if normalized not in {"sigint", "sigterm"}:
             normalized = "sigint"
+        if (
+            self._last_signal_kind == normalized
+            and self._last_signal_monotonic is not None
+            and now - self._last_signal_monotonic <= self._signal_dedupe_window_s
+            and self._pending_handler_interrupts > 0
+        ):
+            return
+        self._last_signal_kind = normalized
+        self._last_signal_monotonic = now
         if self.first_signal_kind is None:
             self.first_signal_kind = normalized
         self.interrupt_count += 1
@@ -116,11 +129,18 @@ class _ShutdownSignalController:
                 else:
                     self.force_exit_code = _SIGINT_EXIT_CODE
 
-    def note_keyboard_interrupt(self) -> None:
+    def note_keyboard_interrupt(self, *, now_monotonic: float | None = None) -> None:
+        now = now_monotonic if now_monotonic is not None else time.monotonic()
         if self._pending_handler_interrupts > 0:
             self._pending_handler_interrupts -= 1
             return
-        self.note_signal(signal_kind="sigint")
+        if (
+            self._last_signal_kind == "sigint"
+            and self._last_signal_monotonic is not None
+            and now - self._last_signal_monotonic <= self._signal_dedupe_window_s
+        ):
+            return
+        self.note_signal(signal_kind="sigint", now_monotonic=now)
 
     @property
     def shutdown_reason(self) -> str:

@@ -446,24 +446,40 @@ def test_maybe_warn_asr_backlog_breaks_single_line_when_renderer_provided(
     assert warned
 
 
-def test_shutdown_signal_controller_forces_exit_on_second_signal() -> None:
+def test_shutdown_signal_controller_dedupes_duplicate_signal_while_handler_interrupt_pending() -> None:
     controller = _ShutdownSignalController()
-    controller.note_signal(signal_kind="sigint")
+    controller.note_signal(signal_kind="sigint", now_monotonic=1.0)
+    controller.note_signal(signal_kind="sigint", now_monotonic=1.2)
     assert not controller.force_exit_requested
     assert controller.shutdown_reason == "Ctrl+C"
+    assert controller.interrupt_count == 1
 
-    controller.note_signal(signal_kind="sigint")
+    controller.note_keyboard_interrupt(now_monotonic=1.25)
+    controller.note_signal(signal_kind="sigint", now_monotonic=1.8)
+    assert controller.force_exit_requested
+    assert controller.force_exit_code == 130
+
+
+def test_shutdown_signal_controller_ignores_fallback_keyboard_interrupt_within_dedupe_window() -> None:
+    controller = _ShutdownSignalController()
+    controller.note_signal(signal_kind="sigint", now_monotonic=10.0)
+    controller.note_keyboard_interrupt(now_monotonic=10.1)
+    controller.note_keyboard_interrupt(now_monotonic=10.2)
+    assert controller.interrupt_count == 1
+    assert not controller.force_exit_requested
+
+    controller.note_keyboard_interrupt(now_monotonic=10.7)
     assert controller.force_exit_requested
     assert controller.force_exit_code == 130
 
 
 def test_shutdown_signal_controller_prefers_sigterm_exit_code_when_sigterm_first() -> None:
     controller = _ShutdownSignalController()
-    controller.note_signal(signal_kind="sigterm")
-    controller.note_keyboard_interrupt()
+    controller.note_signal(signal_kind="sigterm", now_monotonic=20.0)
+    controller.note_keyboard_interrupt(now_monotonic=20.1)
     assert controller.interrupt_count == 1
     assert controller.shutdown_reason == "SIGTERM"
 
-    controller.note_keyboard_interrupt()
+    controller.note_keyboard_interrupt(now_monotonic=20.8)
     assert controller.force_exit_requested
     assert controller.force_exit_code == 143
