@@ -790,6 +790,130 @@ def test_start_duplicate_sigint_signal_plus_keyboard_interrupt_still_drains(
     assert "duplicate signal transcript" in out_path.read_text(encoding="utf-8")
 
 
+def test_start_duplicate_sigint_after_first_interrupt_handled_is_deduped(
+    monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_path = tmp_path / "duplicate-signal-after-handle.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("duplicate after handle transcript", delay_s=0.02)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(48)])
+    state = {"sleep_calls": 0, "join_interrupt_sent": False}
+    controller_ref: dict[str, Any] = {}
+    original_join = cli_module.threading.Thread.join
+
+    @contextmanager
+    def _fake_signal_handlers(shutdown_signals: Any):
+        controller_ref["value"] = shutdown_signals
+        shutdown_signals.note_signal(signal_kind="sigint")
+        yield
+
+    def _sleep_for_initial_interrupt(_seconds: float) -> None:
+        state["sleep_calls"] += 1
+        if state["sleep_calls"] == 3:
+            raise KeyboardInterrupt
+
+    def _join_with_late_duplicate_signal(
+        self: threading.Thread, timeout: float | None = None
+    ) -> None:
+        if state["sleep_calls"] >= 3 and not state["join_interrupt_sent"]:
+            state["join_interrupt_sent"] = True
+            controller = controller_ref.get("value")
+            if controller is not None:
+                controller.note_signal(signal_kind="sigint")
+            raise KeyboardInterrupt
+        original_join(self, timeout=timeout)
+
+    monkeypatch.setattr("narada.cli._install_start_signal_handlers", _fake_signal_handlers)
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _sleep_for_initial_interrupt)
+    monkeypatch.setattr("narada.cli.threading.Thread.join", _join_with_late_duplicate_signal)
+
+    _run_start_for_tests()
+
+    captured = capsys.readouterr()
+    assert state["join_interrupt_sent"]
+    assert "Forced stop requested by second signal." not in captured.err
+    assert "Drain summary: " in captured.out
+    assert "duplicate after handle transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_keyboard_interrupt_during_finalization_join_retries_cleanly(
+    monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_path = tmp_path / "finalization-join-interrupt.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("join interrupt transcript", delay_s=0.02)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(48)])
+    state = {"sleep_calls": 0, "join_interrupt_sent": False}
+    original_join = cli_module.threading.Thread.join
+
+    def _sleep_for_initial_interrupt(_seconds: float) -> None:
+        state["sleep_calls"] += 1
+        if state["sleep_calls"] == 3:
+            raise KeyboardInterrupt
+
+    def _join_with_interrupt_once(self: threading.Thread, timeout: float | None = None) -> None:
+        if state["sleep_calls"] >= 3 and not state["join_interrupt_sent"]:
+            state["join_interrupt_sent"] = True
+            raise KeyboardInterrupt
+        original_join(self, timeout=timeout)
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _sleep_for_initial_interrupt)
+    monkeypatch.setattr("narada.cli.threading.Thread.join", _join_with_interrupt_once)
+
+    _run_start_for_tests()
+
+    captured = capsys.readouterr()
+    assert state["join_interrupt_sent"]
+    assert "Drain summary: " in captured.out
+    assert "join interrupt transcript" in out_path.read_text(encoding="utf-8")
+
+
 def test_start_status_freezes_elapsed_and_includes_compact_drain_metrics(
     monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

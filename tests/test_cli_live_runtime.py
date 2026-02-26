@@ -446,17 +446,15 @@ def test_maybe_warn_asr_backlog_breaks_single_line_when_renderer_provided(
     assert warned
 
 
-def test_shutdown_signal_controller_dedupes_duplicate_signal_while_handler_interrupt_pending() -> (
-    None
-):
+def test_shutdown_signal_controller_dedupes_late_duplicate_signal_within_window() -> None:
     controller = _ShutdownSignalController()
     controller.note_signal(signal_kind="sigint", now_monotonic=1.0)
+    controller.note_keyboard_interrupt(now_monotonic=1.05)
     controller.note_signal(signal_kind="sigint", now_monotonic=1.2)
     assert not controller.force_exit_requested
     assert controller.shutdown_reason == "Ctrl+C"
     assert controller.interrupt_count == 1
 
-    controller.note_keyboard_interrupt(now_monotonic=1.25)
     controller.note_signal(signal_kind="sigint", now_monotonic=1.8)
     assert controller.force_exit_requested
     assert controller.force_exit_code == 130

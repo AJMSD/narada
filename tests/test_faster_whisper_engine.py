@@ -10,6 +10,7 @@ from narada.asr.faster_whisper_engine import (
     _WORKER_BOOTSTRAP_ENV_VAR,
     FasterWhisperEngine,
     _apply_worker_bootstrap_signal_hardening,
+    _detach_worker_console_on_windows,
     _gpu_transcribe_worker_main,
     _GpuWorkerHandle,
     _GpuWorkerRuntimeError,
@@ -681,7 +682,7 @@ def test_gpu_worker_main_invokes_worker_stderr_and_console_ctrl_suppression(
         def put(self, item: dict[str, object]) -> None:
             self.items.append(item)
 
-    suppression_calls = {"ctrl": 0, "stderr": 0}
+    suppression_calls = {"ctrl": 0, "stderr": 0, "detach": 0}
 
     def _record_suppression() -> None:
         suppression_calls["ctrl"] += 1
@@ -689,6 +690,10 @@ def test_gpu_worker_main_invokes_worker_stderr_and_console_ctrl_suppression(
     monkeypatch.setattr(
         "narada.asr.faster_whisper_engine._suppress_windows_console_ctrl_events",
         _record_suppression,
+    )
+    monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine._detach_worker_console_on_windows",
+        lambda: suppression_calls.__setitem__("detach", suppression_calls["detach"] + 1),
     )
     monkeypatch.setattr(
         "narada.asr.faster_whisper_engine._suppress_worker_stderr_on_windows",
@@ -708,6 +713,7 @@ def test_gpu_worker_main_invokes_worker_stderr_and_console_ctrl_suppression(
 
     assert suppression_calls["ctrl"] == 1
     assert suppression_calls["stderr"] == 1
+    assert suppression_calls["detach"] == 1
     assert response_queue.items
     assert response_queue.items[0].get("kind") == "ready"
 
@@ -738,6 +744,10 @@ def test_gpu_worker_main_swallows_windows_console_ctrl_suppression_errors(
             self.items.append(item)
 
     monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine._detach_worker_console_on_windows",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom detach")),
+    )
+    monkeypatch.setattr(
         "narada.asr.faster_whisper_engine._suppress_windows_console_ctrl_events",
         lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
@@ -764,11 +774,15 @@ def test_gpu_worker_main_swallows_windows_console_ctrl_suppression_errors(
 def test_worker_bootstrap_signal_hardening_runs_when_env_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    suppression_calls = {"ctrl": 0, "stderr": 0}
+    suppression_calls = {"ctrl": 0, "stderr": 0, "detach": 0}
     signal_calls: list[int] = []
 
     monkeypatch.setenv(_WORKER_BOOTSTRAP_ENV_VAR, "1")
     monkeypatch.setattr("narada.asr.faster_whisper_engine.os.name", "nt")
+    monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine._detach_worker_console_on_windows",
+        lambda: suppression_calls.__setitem__("detach", suppression_calls["detach"] + 1),
+    )
     monkeypatch.setattr(
         "narada.asr.faster_whisper_engine._suppress_worker_stderr_on_windows",
         lambda: suppression_calls.__setitem__("stderr", suppression_calls["stderr"] + 1),
@@ -786,6 +800,7 @@ def test_worker_bootstrap_signal_hardening_runs_when_env_enabled(
 
     assert suppression_calls["ctrl"] == 1
     assert suppression_calls["stderr"] == 1
+    assert suppression_calls["detach"] == 1
     assert signal_calls
 
 
@@ -794,6 +809,10 @@ def test_worker_bootstrap_signal_hardening_swallows_failures(
 ) -> None:
     monkeypatch.setenv(_WORKER_BOOTSTRAP_ENV_VAR, "1")
     monkeypatch.setattr("narada.asr.faster_whisper_engine.os.name", "nt")
+    monkeypatch.setattr(
+        "narada.asr.faster_whisper_engine._detach_worker_console_on_windows",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom detach")),
+    )
     monkeypatch.setattr(
         "narada.asr.faster_whisper_engine._suppress_worker_stderr_on_windows",
         lambda: (_ for _ in ()).throw(RuntimeError("boom stderr")),
@@ -811,6 +830,13 @@ def test_suppress_worker_stderr_on_windows_noops_on_non_windows(
 ) -> None:
     monkeypatch.setattr("narada.asr.faster_whisper_engine.os.name", "posix")
     _suppress_worker_stderr_on_windows()
+
+
+def test_detach_worker_console_on_windows_noops_on_non_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("narada.asr.faster_whisper_engine.os.name", "posix")
+    _detach_worker_console_on_windows()
 
 
 def test_worker_process_name_includes_device() -> None:
