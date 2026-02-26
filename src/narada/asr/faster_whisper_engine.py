@@ -215,6 +215,26 @@ def _suppress_windows_console_ctrl_events() -> None:
         return
 
 
+def _detach_worker_console_on_windows() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return
+        kernel32 = getattr(windll, "kernel32", None)
+        if kernel32 is None:
+            return
+        free_console = getattr(kernel32, "FreeConsole", None)
+        if free_console is None:
+            return
+        free_console()
+    except Exception:
+        return
+
+
 def _suppress_worker_stderr_on_windows() -> None:
     global _WORKER_STDERR_STREAM
     if os.name != "nt":
@@ -250,6 +270,7 @@ def _apply_worker_bootstrap_signal_hardening() -> None:
     if os.environ.get(_WORKER_BOOTSTRAP_ENV_VAR, "").strip() != "1":
         return
     try:
+        _detach_worker_console_on_windows()
         _suppress_worker_stderr_on_windows()
         _suppress_windows_console_ctrl_events()
         _ignore_console_interrupt_signals()
@@ -268,6 +289,10 @@ def _gpu_transcribe_worker_main(
     device: str,
     compute_type: str,
 ) -> None:
+    try:
+        _detach_worker_console_on_windows()
+    except Exception:
+        pass
     try:
         _suppress_worker_stderr_on_windows()
     except Exception:
