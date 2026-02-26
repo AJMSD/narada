@@ -663,6 +663,9 @@ def test_start_interrupt_displays_asr_shutdown_notice(
         == 1
     )
     assert "eta=~" in captured.out
+    assert "Drain summary: " in captured.out
+    assert "asr_ok=" in captured.out
+    assert "committed_new=" in captured.out
     assert "shutdown notice transcript" in out_path.read_text(encoding="utf-8")
 
 
@@ -719,7 +722,72 @@ def test_start_first_signal_before_first_status_render_emits_notice_once(
     )
     assert "state=paused/draining" in captured.out
     assert "eta=~" in captured.out
+    assert "Drain summary: " in captured.out
     assert "early interrupt transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_duplicate_sigint_signal_plus_keyboard_interrupt_still_drains(
+    monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_path = tmp_path / "duplicate-signal-drain.txt"
+    cfg = _runtime_config(
+        "mic",
+        out_path,
+        notes_interval_seconds=0.2,
+        notes_overlap_seconds=0.0,
+    )
+    slow_engine = _SlowEngine("duplicate signal transcript", delay_s=0.02)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(48)])
+    state = {"calls": 0}
+    controller_ref: dict[str, Any] = {}
+
+    @contextmanager
+    def _fake_signal_handlers(shutdown_signals: Any):
+        controller_ref["value"] = shutdown_signals
+        shutdown_signals.note_signal(signal_kind="sigint", now_monotonic=100.0)
+        yield
+
+    def _sleep_with_duplicate_signal_then_interrupt(_seconds: float) -> None:
+        state["calls"] += 1
+        if state["calls"] == 3:
+            controller = controller_ref.get("value")
+            if controller is not None:
+                controller.note_signal(signal_kind="sigint", now_monotonic=100.2)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("narada.cli._install_start_signal_handlers", _fake_signal_handlers)
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _sleep_with_duplicate_signal_then_interrupt)
+
+    _run_start_for_tests()
+
+    captured = capsys.readouterr()
+    assert (
+        captured.err.count(
+            "Signal received. Stopping capture and draining ASR backlog to zero before exit."
+        )
+        == 1
+    )
+    assert "Forced stop requested by second signal." not in captured.err
+    assert "Drain summary: " in captured.out
+    assert "duplicate signal transcript" in out_path.read_text(encoding="utf-8")
 
 
 def test_start_status_freezes_elapsed_and_includes_compact_drain_metrics(
@@ -982,6 +1050,7 @@ def test_start_shutdown_queue_full_keeps_final_tail_bounded(
 def test_start_shutdown_forces_exit_on_second_ctrl_c_during_drain(
     monkeypatch: Any,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     out_path = tmp_path / "repeated-ctrlc-drain.txt"
     cfg = _runtime_config(
@@ -1004,9 +1073,11 @@ def test_start_shutdown_forces_exit_on_second_ctrl_c_during_drain(
     def _sleep_with_interrupt(_seconds: float) -> None:
         state["calls"] += 1
         if state["calls"] == 3:
+            raise KeyboardInterrupt
+        if state["calls"] == 4:
             controller = controller_ref.get("value")
             if controller is not None:
-                controller.note_signal(signal_kind="sigint")
+                controller.note_signal(signal_kind="sigint", now_monotonic=200.0)
             raise KeyboardInterrupt
 
     monkeypatch.setattr("narada.cli._install_start_signal_handlers", _fake_signal_handlers)
@@ -1033,13 +1104,16 @@ def test_start_shutdown_forces_exit_on_second_ctrl_c_during_drain(
     with pytest.raises(typer.Exit) as exc_info:
         _run_start_for_tests()
 
+    captured = capsys.readouterr()
     assert state["calls"] >= 3
     assert exc_info.value.exit_code == 130
+    assert "Forced exit during drain: " in captured.err
 
 
 def test_start_second_signal_after_sigterm_forces_sigterm_exit_code(
     monkeypatch: Any,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     out_path = tmp_path / "sigterm-second-force-exit.txt"
     cfg = _runtime_config(
@@ -1086,8 +1160,10 @@ def test_start_second_signal_after_sigterm_forces_sigterm_exit_code(
     with pytest.raises(typer.Exit) as exc_info:
         _run_start_for_tests()
 
+    captured = capsys.readouterr()
     assert state["calls"] >= 4
     assert exc_info.value.exit_code == 143
+    assert "Forced exit during drain: " in captured.err
 
 
 def test_start_falls_back_to_recommended_engine(monkeypatch: Any, tmp_path: Path) -> None:
