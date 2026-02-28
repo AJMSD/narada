@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
-Mode = Literal["mic", "system", "mixed"]
+Mode = Literal["mic", "system"]
 Model = Literal["tiny", "small", "medium", "large"]
 Compute = Literal["cpu", "cuda", "metal", "auto"]
 Engine = Literal["faster-whisper", "whisper-cpp"]
@@ -15,7 +15,7 @@ NoiseSuppress = Literal["off", "rnnoise", "webrtc"]
 WriterFsyncMode = Literal["line", "periodic"]
 AsrPreset = Literal["fast", "balanced", "accurate"]
 
-MODE_VALUES: tuple[Mode, ...] = ("mic", "system", "mixed")
+MODE_VALUES: tuple[Mode, ...] = ("mic", "system")
 MODEL_VALUES: tuple[Model, ...] = ("tiny", "small", "medium", "large")
 COMPUTE_VALUES: tuple[Compute, ...] = ("cpu", "cuda", "metal", "auto")
 ENGINE_VALUES: tuple[Engine, ...] = ("faster-whisper", "whisper-cpp")
@@ -244,6 +244,11 @@ def _parse_bool(raw_value: str, field_name: str) -> bool:
 
 def _parse_mode(raw_value: str) -> Mode:
     normalized = raw_value.strip().lower()
+    if normalized == "mixed":
+        raise ConfigError(
+            "Mode 'mixed' has been removed. "
+            "Run separate sessions with --mode mic and --mode system."
+        )
     if normalized not in MODE_VALUES:
         raise ConfigError(f"Invalid mode '{raw_value}'. Expected one of: {', '.join(MODE_VALUES)}.")
     return cast(Mode, normalized)
@@ -253,7 +258,7 @@ def _parse_model(raw_value: str) -> Model:
     normalized = raw_value.strip().lower()
     if normalized not in MODEL_VALUES:
         raise ConfigError(
-            f"Invalid model '{raw_value}'. Expected one of: {', '.join(MODE_VALUES)}."
+            f"Invalid model '{raw_value}'. Expected one of: {', '.join(MODEL_VALUES)}."
         )
     return cast(Model, normalized)
 
@@ -556,9 +561,9 @@ def build_runtime_config(
     if not 1 <= port <= 65535:
         raise ConfigError("Port must be between 1 and 65535.")
 
-    if mode in {"mic", "mixed"} and not mic:
+    if mode == "mic" and not mic:
         raise ConfigError("Mode requires --mic (or NARADA_MIC).")
-    if mode in {"system", "mixed"} and not system:
+    if mode == "system" and not system:
         raise ConfigError("Mode requires --system (or NARADA_SYSTEM).")
 
     model_dir_faster_whisper = _choose_optional_path(

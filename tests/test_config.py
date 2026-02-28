@@ -52,8 +52,8 @@ def test_language_aliases_are_normalized() -> None:
     assert languages == ("hi", "en")
 
 
-def test_mode_requires_device_selectors() -> None:
-    with pytest.raises(ConfigError):
+def test_mode_mixed_rejected_with_migration_guidance() -> None:
+    with pytest.raises(ConfigError, match="Mode 'mixed' has been removed"):
         build_runtime_config(ConfigOverrides(mode="mixed", mic="1"), env={})
 
 

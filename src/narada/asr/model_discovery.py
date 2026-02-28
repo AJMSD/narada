@@ -54,14 +54,14 @@ def whisper_cpp_model_url(model_name: str) -> str:
     return f"{WHISPER_CPP_MODEL_REPO_URL}/resolve/main/ggml-{model_name}.bin"
 
 
-def _default_hf_hub_dir() -> Path:
+def default_hf_hub_dir() -> Path:
     hf_home = os.environ.get("HF_HOME")
     if hf_home:
         return Path(hf_home) / "hub"
     return Path.home() / ".cache" / "huggingface" / "hub"
 
 
-def _default_whisper_cpp_model_dir() -> Path:
+def default_whisper_cpp_model_dir() -> Path:
     if os.name == "nt":
         local_app_data = os.environ.get("LOCALAPPDATA")
         if local_app_data:
@@ -91,7 +91,7 @@ def resolve_faster_whisper_model_path(model_name: str, model_dir: Path | None = 
                 return directory
         return model_dir / f"faster-whisper-{model_name}"
 
-    hf_root = _default_hf_hub_dir()
+    hf_root = default_hf_hub_dir()
     repo_dir = hf_root / f"models--Systran--faster-whisper-{model_name}"
     snapshot = _latest_snapshot_dir(repo_dir / "snapshots")
     if snapshot is not None and (snapshot / "model.bin").exists():
@@ -102,9 +102,9 @@ def resolve_faster_whisper_model_path(model_name: str, model_dir: Path | None = 
 def resolve_whisper_cpp_model_path(model_name: str, model_dir: Path | None = None) -> Path:
     base = model_dir or Path(os.environ.get("NARADA_MODEL_DIR_WHISPER_CPP", ""))
     if str(base) == ".":
-        base = _default_whisper_cpp_model_dir()
+        base = default_whisper_cpp_model_dir()
     if not str(base):
-        base = _default_whisper_cpp_model_dir()
+        base = default_whisper_cpp_model_dir()
     return base / f"ggml-{model_name}.bin"
 
 
@@ -152,11 +152,13 @@ def build_start_model_preflight(
     if not discovery.any_present:
         messages.append("No local ASR model files were detected for faster-whisper or whisper.cpp.")
         messages.append(
-            f"Download faster-whisper model: {discovery.faster_whisper.model_url} "
-            f"(setup: {discovery.faster_whisper.setup_url})"
+            "Narada will try to auto-download the selected engine model before capture starts."
         )
         messages.append(
-            f"Download whisper.cpp model: {discovery.whisper_cpp.model_url} "
+            "If auto-download fails (for example offline), use these setup links: "
+            f"faster-whisper {discovery.faster_whisper.model_url} "
+            f"(setup: {discovery.faster_whisper.setup_url}) | "
+            f"whisper.cpp {discovery.whisper_cpp.model_url} "
             f"(setup: {discovery.whisper_cpp.setup_url})"
         )
         return StartModelPreflight(
@@ -188,9 +190,10 @@ def build_start_model_preflight(
             f"'{selected}' does not have local model files for "
             f"'{discovery.faster_whisper.model_name}'."
         )
+        messages.append("Narada will try to auto-download the selected model first.")
         messages.append(
             f"Detected {recommended_engine} model files on this device. "
-            f"Narada will run with {recommended_engine}."
+            f"If selected-engine download fails, Narada will run with {recommended_engine}."
         )
         if selected == "faster-whisper":
             missing = discovery.faster_whisper

@@ -1,7 +1,7 @@
 # Narada
 
 ## What Narada Is
-Narada is a local-first CLI tool for transcribing meeting audio to text files. It is designed to run without cloud upload and to support microphone, system, and mixed audio workflows across Windows, Linux, and macOS.
+Narada is a local-first CLI tool for transcribing meeting audio to text files. It is designed to run without cloud upload and to support microphone and system audio workflows across Windows, Linux, and macOS.
 
 ## Why I Built It
 Many meeting transcription tools require paid APIs or cloud upload of sensitive audio. Narada is built to provide a private local workflow with clear CLI controls and LAN-only sharing when explicitly enabled.
@@ -19,7 +19,7 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - On Windows, live `mic` and `system` capture both use the same backend (`PyAudioWPatch`) so listed device IDs match capture runtime behavior.
 - Shared logical IDs for combo devices; Narada auto-selects input/output endpoint by command context.
 - `--language auto` default with multilingual input support through comma-separated values.
-- Software mixed mode target (mic + system in Narada).
+- Automatic model download and cache reuse for supported ASR engines.
 - Continuous live capture for mic/system modes with low-latency chunk defaults
   (2.0s chunk, 0.5s overlap) and wall-clock forced flush controls.
 - Notes-first live runtime for TTY sessions: audio is continuously spooled to disk,
@@ -60,7 +60,7 @@ narada start --mode mic --mic 1 --engine faster-whisper --asr-preset balanced
 ```
 
 ## Model Setup
-Narada checks local model availability at startup and shows setup guidance when models are missing.
+Narada checks local model availability at startup and auto-downloads missing models for the selected engine.
 
 Model sources:
 - faster-whisper: `https://huggingface.co/Systran/faster-whisper-small`
@@ -73,12 +73,13 @@ Typical local paths on Windows:
   - `C:\Users\<you>\AppData\Local\narada\models\whisper-cpp\ggml-small.bin`
 
 One-time setup behavior:
-- If a selected model is missing and another local model family is available, Narada reports that and can run with the available one.
+- If a selected model is missing, Narada downloads it into the expected cache/model directory and reuses it on future runs.
+- If selected-engine download fails and another engine already has local model files, Narada falls back to that local engine for the run.
 - Once model files are present locally, runs are offline unless you choose to fetch/update models.
 
 ## Limitations
 - System-audio capture depends on OS and backend support. On Windows, Narada uses `PyAudioWPatch` and WASAPI loopback sources; channel count is detected at runtime and downmixed to mono before transcription, with fallback through common values when needed.
-- Windows live capture (`--mode mic`, `--mode system`, `--mode mixed`) requires `PyAudioWPatch`.
+- Windows live capture (`--mode mic`, `--mode system`) requires `PyAudioWPatch`.
 - Bluetooth HFP devices (Hands-Free Profile) do not expose a standard PCM loopback endpoint on Windows and will produce a descriptive error. If your driver exposes **Stereo Mix**, use it as an input path (`narada start --mode mic --mic <stereo-mix-id>`).
 - macOS system capture usually requires a virtual loopback device (for example BlackHole).
 - ASR runtime availability depends on optional dependencies being installed.
@@ -126,14 +127,14 @@ Start a session:
 narada start --mode mic --mic 1 --out ./transcripts/session.txt --language auto
 ```
 
-Start mixed mode with different microphone and system-output devices:
+Start system capture:
 ```bash
-narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt
+narada start --mode system --system 7 --out ./transcripts/session.txt
 ```
 
 Start and serve live transcript in one command:
 ```bash
-narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --serve --bind 0.0.0.0 --port 8787 --qr
+narada start --mode mic --mic 1 --out ./transcripts/session.txt --serve --bind 0.0.0.0 --port 8787 --qr
 ```
 
 Tune live wall-clock flush and capture backlog warnings:
@@ -143,17 +144,17 @@ narada start --mode system --system 7 --out ./transcripts/session.txt --wall-flu
 
 Tune notes-first interval scheduling and spool retention:
 ```bash
-narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --notes-interval-seconds 12 --notes-overlap-seconds 1.5 --notes-commit-holdback-windows 1 --asr-backlog-warn-seconds 45 --keep-spool
+narada start --mode mic --mic 1 --out ./transcripts/session.txt --notes-interval-seconds 12 --notes-overlap-seconds 1.5 --notes-commit-holdback-windows 1 --asr-backlog-warn-seconds 45 --keep-spool
 ```
 
 Tune notes spool flush batching thresholds:
 ```bash
-narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --spool-flush-interval-seconds 0.25 --spool-flush-bytes 65536
+narada start --mode mic --mic 1 --out ./transcripts/session.txt --spool-flush-interval-seconds 0.25 --spool-flush-bytes 65536
 ```
 
 Use compatibility mode for spool flush (flush every append):
 ```bash
-narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --spool-flush-interval-seconds 0 --spool-flush-bytes 0
+narada start --mode mic --mic 1 --out ./transcripts/session.txt --spool-flush-interval-seconds 0 --spool-flush-bytes 0
 ```
 
 Use periodic transcript fsync mode:
@@ -190,7 +191,7 @@ narada serve --file ./transcripts/session.txt --port 8787 --bind 0.0.0.0 --serve
 
 Start + serve with token auth in one command:
 ```bash
-narada start --mode mixed --mic 1 --system 7 --out ./transcripts/session.txt --serve --bind 0.0.0.0 --port 8787 --serve-token mytoken
+narada start --mode system --system 7 --out ./transcripts/session.txt --serve --bind 0.0.0.0 --port 8787 --serve-token mytoken
 ```
 
 Run checks:
@@ -209,7 +210,7 @@ Structured stdin for `start` (useful for tests or automation):
 - Plain text line: treated as transcript text.
 - JSON text payload: `{"text":"hello","confidence":0.9}`
 - JSON audio payload (mic/system): `{"audio":{"samples":[...],"sample_rate_hz":16000,"channels":1}}`
-- JSON mixed payload: `{"mic":{...},"system":{...}}` (Narada normalizes and software-mixes before ASR).
+- Legacy mixed payloads are rejected with migration guidance; run separate `mic` and `system` sessions.
 
 ## ASR Presets And Benchmarking
 Preset behavior for faster-whisper:

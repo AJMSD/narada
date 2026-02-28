@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 import narada.cli as cli_module
 from narada.asr.base import AsrEngine, TranscriptionRequest, TranscriptSegment
 from narada.asr.model_discovery import StartModelPreflight
+from narada.asr.model_download import ModelPreparationError
 from narada.audio.capture import CapturedFrame, CaptureError, DeviceDisconnectedError
 from narada.cli import app, start_command
 from narada.config import RuntimeConfig
@@ -190,8 +191,8 @@ def _runtime_config(
 ) -> RuntimeConfig:
     return RuntimeConfig(
         mode=mode,  # type: ignore[arg-type]
-        mic="1" if mode in {"mic", "mixed"} else None,
-        system="2" if mode in {"system", "mixed"} else None,
+        mic="1" if mode == "mic" else None,
+        system="2" if mode == "system" else None,
         out=out_path,
         model="small",
         compute="cpu",
@@ -251,6 +252,14 @@ def _run_start_for_tests(**kwargs: Any) -> None:
     }
     defaults.update(kwargs)
     start_command(**defaults)
+
+
+@pytest.fixture(autouse=True)
+def _stub_model_prepare(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "narada.cli.ensure_engine_model_available",
+        lambda **_kwargs: Path("cached-model"),
+    )
 
 
 def test_start_integration_mic_mode(monkeypatch: Any, tmp_path: Path) -> None:
@@ -377,58 +386,26 @@ def test_start_integration_system_mode(monkeypatch: Any, tmp_path: Path) -> None
     assert fake_engine.calls >= 1
 
 
-def test_start_integration_mixed_mode(monkeypatch: Any, tmp_path: Path) -> None:
-    out_path = tmp_path / "mixed.txt"
-    cfg = _runtime_config("mixed", out_path)
-    fake_engine = _FakeEngine("mixed transcript")
-    mic_capture = _FakeCapture(frames=[_frame()])
-    system_capture = _FakeCapture(frames=[_frame()])
-
-    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
-    monkeypatch.setattr(
-        "narada.cli._resolve_selected_devices",
-        lambda *_args, **_kwargs: (
-            AudioDevice(1, "Mic", "input"),
-            AudioDevice(2, "Loopback", "loopback"),
-            [],
-        ),
-    )
-    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(
-        "narada.cli.build_start_model_preflight",
-        lambda *_args, **_kwargs: StartModelPreflight(
-            selected_engine="faster-whisper",
-            selected_available=True,
-            recommended_engine=None,
-            messages=(),
-        ),
-    )
-    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: fake_engine)
-    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
-    monkeypatch.setattr("narada.cli.open_system_capture", lambda *_args, **_kwargs: system_capture)
-    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
-    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls())
-
-    _run_start_for_tests()
-    assert "mixed transcript" in out_path.read_text(encoding="utf-8")
-    assert mic_capture.closed
-    assert system_capture.closed
-    assert fake_engine.calls >= 1
+def test_start_cli_rejects_mixed_mode() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["start", "--mode", "mixed", "--mic", "1"])
+    assert result.exit_code != 0
+    assert "Mode 'mixed' has been removed" in result.output
+    assert "--mode mic and --mode system" in result.output
 
 
-def test_notes_first_mixed_large_backlog_still_commits_during_runtime_cycle(
+def test_notes_first_mic_large_backlog_still_commits_during_runtime_cycle(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    out_path = tmp_path / "mixed-large-backlog.txt"
+    out_path = tmp_path / "mic-large-backlog.txt"
     cfg = _runtime_config(
-        "mixed",
+        "mic",
         out_path,
         notes_interval_seconds=0.2,
         notes_overlap_seconds=0.0,
     )
-    slow_engine = _SlowEngine("mixed backlog transcript", delay_s=0.02)
+    slow_engine = _SlowEngine("mic backlog transcript", delay_s=0.02)
     mic_capture = _FakeCapture(frames=[_frame() for _ in range(5000)])
-    system_capture = _FakeCapture(frames=[_frame() for _ in range(5000)])
     drain_calls = {"count": 0}
     original_drain = cli_module._drain_asr_results
 
@@ -458,29 +435,27 @@ def test_notes_first_mixed_large_backlog_still_commits_during_runtime_cycle(
     )
     monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
     monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
-    monkeypatch.setattr("narada.cli.open_system_capture", lambda *_args, **_kwargs: system_capture)
     monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
     monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=6))
 
     _run_start_for_tests()
 
     assert drain_calls["count"] >= 4
-    assert "mixed backlog transcript" in out_path.read_text(encoding="utf-8")
+    assert "mic backlog transcript" in out_path.read_text(encoding="utf-8")
 
 
-def test_start_mixed_shutdown_with_unbalanced_pending_frames_completes(
+def test_start_mic_shutdown_with_large_pending_frames_completes(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    out_path = tmp_path / "mixed-unbalanced-shutdown.txt"
+    out_path = tmp_path / "mic-pending-shutdown.txt"
     cfg = _runtime_config(
-        "mixed",
+        "mic",
         out_path,
         notes_interval_seconds=0.2,
         notes_overlap_seconds=0.0,
     )
-    slow_engine = _SlowEngine("mixed unbalanced transcript", delay_s=0.01)
-    mic_capture = _FakeCapture(frames=[_frame() for _ in range(24)])
-    system_capture = _FakeCapture(frames=[_frame() for _ in range(4)])
+    slow_engine = _SlowEngine("mic pending transcript", delay_s=0.01)
+    mic_capture = _FakeCapture(frames=[_frame() for _ in range(28)])
     sleep_state = {"calls": 0, "interrupted": False}
 
     def _sleep_with_single_interrupt(_seconds: float) -> None:
@@ -489,7 +464,7 @@ def test_start_mixed_shutdown_with_unbalanced_pending_frames_completes(
             sleep_state["interrupted"] = True
             raise KeyboardInterrupt
         if sleep_state["interrupted"] and sleep_state["calls"] > 80:
-            raise AssertionError("mixed-mode shutdown stalled with unbalanced pending frames")
+            raise AssertionError("shutdown stalled while draining pending mic frames")
 
     monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
     monkeypatch.setattr(
@@ -512,16 +487,14 @@ def test_start_mixed_shutdown_with_unbalanced_pending_frames_completes(
     )
     monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: slow_engine)
     monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
-    monkeypatch.setattr("narada.cli.open_system_capture", lambda *_args, **_kwargs: system_capture)
     monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
     monkeypatch.setattr("narada.cli.time.sleep", _sleep_with_single_interrupt)
 
     _run_start_for_tests()
 
     assert sleep_state["interrupted"]
-    assert "mixed unbalanced transcript" in out_path.read_text(encoding="utf-8")
+    assert "mic pending transcript" in out_path.read_text(encoding="utf-8")
     assert mic_capture.closed
-    assert system_capture.closed
 
 
 def test_shutdown_drain_batches_progressively_with_large_pending_capture(
@@ -1379,10 +1352,12 @@ def test_start_second_signal_after_sigterm_forces_sigterm_exit_code(
     assert "Forced exit during drain: " in captured.err
 
 
-def test_start_falls_back_to_recommended_engine(monkeypatch: Any, tmp_path: Path) -> None:
-    out_path = tmp_path / "fallback.txt"
+def test_start_keeps_selected_engine_when_model_prepare_succeeds(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    out_path = tmp_path / "selected-engine.txt"
     cfg = _runtime_config("mic", out_path)
-    fake_engine = _FakeEngine("fallback transcript")
+    fake_engine = _FakeEngine("selected transcript")
     mic_capture = _FakeCapture(frames=[_frame()])
     selected_engine_name: dict[str, str] = {}
 
@@ -1413,8 +1388,95 @@ def test_start_falls_back_to_recommended_engine(monkeypatch: Any, tmp_path: Path
 
     _run_start_for_tests()
 
-    assert selected_engine_name["value"] == "whisper-cpp"
+    assert selected_engine_name["value"] == "faster-whisper"
+    assert "selected transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_falls_back_to_recommended_engine_on_model_prepare_failure(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    out_path = tmp_path / "fallback.txt"
+    cfg = _runtime_config("mic", out_path)
+    fake_engine = _FakeEngine("fallback transcript")
+    mic_capture = _FakeCapture(frames=[_frame()])
+    built_engines: list[str] = []
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=False,
+            recommended_engine="whisper-cpp",
+            messages=("Detected whisper-cpp model files on this device.",),
+        ),
+    )
+
+    def _build_engine(engine_name: str, *_args: Any, **_kwargs: Any) -> AsrEngine:
+        built_engines.append(engine_name)
+        return fake_engine
+
+    attempts = {"count": 0}
+
+    def _ensure_model(**kwargs: Any) -> Path:
+        attempts["count"] += 1
+        if kwargs["engine_name"] == "faster-whisper":
+            raise ModelPreparationError("simulated download failure")
+        return Path("cached-model")
+
+    monkeypatch.setattr("narada.cli.build_engine", _build_engine)
+    monkeypatch.setattr("narada.cli.ensure_engine_model_available", _ensure_model)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls())
+
+    _run_start_for_tests()
+
+    assert attempts["count"] == 2
+    assert built_engines == ["faster-whisper", "whisper-cpp"]
     assert "fallback transcript" in out_path.read_text(encoding="utf-8")
+
+
+def test_start_errors_when_model_prepare_fails_without_fallback(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    out_path = tmp_path / "no-fallback.txt"
+    cfg = _runtime_config("mic", out_path)
+    fake_engine = _FakeEngine("unused")
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="faster-whisper",
+            selected_available=False,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: fake_engine)
+
+    def _raise_prepare_error(**_kwargs: Any) -> Path:
+        raise ModelPreparationError("download failed")
+
+    monkeypatch.setattr(
+        "narada.cli.ensure_engine_model_available",
+        _raise_prepare_error,
+    )
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+
+    with pytest.raises(typer.BadParameter, match="download failed"):
+        _run_start_for_tests()
 
 
 def test_start_with_serve_launches_and_stops_server(monkeypatch: Any, tmp_path: Path) -> None:

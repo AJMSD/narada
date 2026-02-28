@@ -5,9 +5,7 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from narada.audio.mixer import AudioChunk, mix_audio_chunks
-
-StartMode = Literal["mic", "system", "mixed"]
+StartMode = Literal["mic", "system"]
 
 
 @dataclass(frozen=True)
@@ -40,7 +38,7 @@ def _parse_int(value: object, field_name: str) -> int:
     return value
 
 
-def _parse_audio_chunk(payload: dict[str, Any], prefix: str = "") -> AudioChunk:
+def _parse_audio_chunk(payload: dict[str, Any], prefix: str = "") -> _AudioChunk:
     samples = _parse_numeric_sequence(payload.get(f"{prefix}samples"), f"{prefix}samples")
     sample_rate_hz = _parse_int(payload.get(f"{prefix}sample_rate_hz"), f"{prefix}sample_rate_hz")
     channels_raw = payload.get(f"{prefix}channels", 1)
@@ -49,7 +47,14 @@ def _parse_audio_chunk(payload: dict[str, Any], prefix: str = "") -> AudioChunk:
         raise ValueError(f"{prefix}sample_rate_hz must be positive.")
     if channels <= 0:
         raise ValueError(f"{prefix}channels must be positive.")
-    return AudioChunk(samples=samples, sample_rate_hz=sample_rate_hz, channels=channels)
+    return _AudioChunk(samples=samples, sample_rate_hz=sample_rate_hz, channels=channels)
+
+
+@dataclass(frozen=True)
+class _AudioChunk:
+    samples: tuple[float, ...]
+    sample_rate_hz: int
+    channels: int
 
 
 def parse_input_line(line: str, mode: StartMode) -> ParsedInput | None:
@@ -78,16 +83,9 @@ def parse_input_line(line: str, mode: StartMode) -> ParsedInput | None:
             raise ValueError("confidence must be between 0.0 and 1.0.")
         return ParsedInput(text=text_field.strip(), confidence=confidence)
 
-    if mode == "mixed":
-        mic_payload = payload.get("mic")
-        system_payload = payload.get("system")
-        if not isinstance(mic_payload, dict) or not isinstance(system_payload, dict):
-            raise ValueError("Mixed mode JSON requires 'mic' and 'system' objects.")
-        mic_chunk = _parse_audio_chunk(mic_payload)
-        system_chunk = _parse_audio_chunk(system_payload)
-        mixed_samples, mixed_rate = mix_audio_chunks(mic_chunk, system_chunk)
-        return ParsedInput(
-            audio=MonoAudioFrame(samples=tuple(mixed_samples), sample_rate_hz=mixed_rate)
+    if "mic" in payload or "system" in payload:
+        raise ValueError(
+            "Mixed JSON payloads are no longer supported. Run separate mic and system sessions."
         )
 
     if "audio" in payload:

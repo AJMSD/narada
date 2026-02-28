@@ -16,8 +16,9 @@ def test_model_discovery_no_models_present(tmp_path: Path) -> None:
     preflight = build_start_model_preflight(discovery, "faster-whisper")
     assert not preflight.selected_available
     assert preflight.recommended_engine is None
-    assert any("Download faster-whisper model" in line for line in preflight.messages)
-    assert any("Download whisper.cpp model" in line for line in preflight.messages)
+    assert any("auto-download the selected engine model" in line for line in preflight.messages)
+    assert any("faster-whisper" in line for line in preflight.messages)
+    assert any("whisper.cpp" in line for line in preflight.messages)
 
 
 def test_model_discovery_faster_whisper_only(tmp_path: Path) -> None:
@@ -34,7 +35,11 @@ def test_model_discovery_faster_whisper_only(tmp_path: Path) -> None:
     assert discovery.faster_whisper.present
     assert not discovery.whisper_cpp.present
     assert preflight.recommended_engine == "faster-whisper"
-    assert any("Narada will run with faster-whisper" in line for line in preflight.messages)
+    assert any("auto-download the selected model first" in line for line in preflight.messages)
+    assert any(
+        "selected-engine download fails, Narada will run with faster-whisper" in line
+        for line in preflight.messages
+    )
 
 
 def test_model_discovery_whisper_cpp_only(tmp_path: Path) -> None:
@@ -51,4 +56,8 @@ def test_model_discovery_whisper_cpp_only(tmp_path: Path) -> None:
     assert not discovery.faster_whisper.present
     assert discovery.whisper_cpp.present
     assert preflight.recommended_engine == "whisper-cpp"
-    assert any("Narada will run with whisper-cpp" in line for line in preflight.messages)
+    assert any("auto-download the selected model first" in line for line in preflight.messages)
+    assert any(
+        "selected-engine download fails, Narada will run with whisper-cpp" in line
+        for line in preflight.messages
+    )

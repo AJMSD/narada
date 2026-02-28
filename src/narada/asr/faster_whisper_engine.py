@@ -1067,6 +1067,12 @@ class FasterWhisperEngine:
         resolved = resolve_faster_whisper_model_path(model_name, explicit_dir)
         if resolved.exists():
             return str(resolved)
+        if explicit_dir is not None:
+            raise EngineUnavailableError(
+                "faster-whisper model missing in configured directory: "
+                f"{resolved}. Verify --model-dir-faster-whisper (or "
+                "NARADA_MODEL_DIR_FASTER_WHISPER) and download the model."
+            )
         return model_name
 
     @classmethod

@@ -18,24 +18,13 @@ def test_parse_input_line_json_text_with_confidence() -> None:
     assert parsed.confidence == 0.72
 
 
-def test_parse_input_line_mixed_json_audio() -> None:
+def test_parse_input_line_legacy_mixed_json_is_rejected() -> None:
     payload = (
         '{"mic":{"samples":[0.1,0.1,0.3,0.3],"sample_rate_hz":16000,"channels":2},'
         '"system":{"samples":[0.2,-0.2],"sample_rate_hz":8000,"channels":1}}'
     )
-    parsed = parse_input_line(payload, mode="mixed")
-    assert parsed is not None
-    assert parsed.text is None
-    assert parsed.audio is not None
-    assert parsed.audio.sample_rate_hz == 16000
-    assert len(parsed.audio.samples) > 0
-
-
-def test_parse_input_line_mixed_requires_both_sources() -> None:
-    with pytest.raises(ValueError):
-        parse_input_line(
-            '{"mic":{"samples":[0.1],"sample_rate_hz":16000,"channels":1}}', mode="mixed"
-        )
+    with pytest.raises(ValueError, match="Mixed JSON payloads are no longer supported"):
+        parse_input_line(payload, mode="mic")
 
 
 def test_parse_input_line_audio_payload_for_single_mode() -> None:

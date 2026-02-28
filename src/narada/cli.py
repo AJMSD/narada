@@ -27,6 +27,7 @@ from narada.asr.base import (
     build_engine,
 )
 from narada.asr.model_discovery import build_start_model_preflight, discover_models
+from narada.asr.model_download import ModelPreparationError, ensure_engine_model_available
 from narada.audio.capture import (
     CapturedFrame,
     CaptureError,
@@ -34,9 +35,7 @@ from narada.audio.capture import (
     DeviceDisconnectedError,
     open_mic_capture,
     open_system_capture,
-    pcm16le_to_float32,
 )
-from narada.audio.mixer import AudioChunk, DriftResyncState, mix_audio_chunks
 from narada.config import ConfigError, ConfigOverrides, RuntimeConfig, build_runtime_config
 from narada.devices import (
     DEVICE_TYPES,
@@ -67,7 +66,7 @@ from narada.server import (
     serve_transcript_file,
     start_transcript_server,
 )
-from narada.start_runtime import MonoAudioFrame, mono_frame_to_pcm16le, parse_input_line
+from narada.start_runtime import mono_frame_to_pcm16le, parse_input_line
 from narada.writer import TranscriptWriter
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Narada local transcript CLI.")
@@ -296,9 +295,9 @@ def _resolve_selected_devices(
     all_devices = enumerate_devices(include_all=True)
     resolved_mic: AudioDevice | None = None
     resolved_system: AudioDevice | None = None
-    if mode in {"mic", "mixed"} and mic:
+    if mode == "mic" and mic:
         resolved_mic = resolve_device(mic, selectable_devices, {"input"})
-    if mode in {"system", "mixed"} and system:
+    if mode == "system" and system:
         resolved_system = resolve_device(
             system,
             selectable_devices,
@@ -748,7 +747,6 @@ def _run_tty_notes_first(
     writer: TranscriptWriter,
     performance: RuntimePerformance,
     started_at: float,
-    mixed_resync_state: DriftResyncState,
     shutdown_signals: _ShutdownSignalController,
 ) -> bool:
     stopped_by_user = False
@@ -836,7 +834,6 @@ def _run_tty_notes_first(
         system_frames: deque[CapturedFrame],
         now_monotonic: float,
         max_frames: int | None,
-        allow_unpaired_mixed: bool = False,
     ) -> int:
         if max_frames is not None and max_frames <= 0:
             return 0
@@ -869,76 +866,6 @@ def _run_tty_notes_first(
                 ingested += 1
             return ingested
 
-        if config.mode == "mixed" and mic_capture is not None and system_capture is not None:
-            while mic_frames and system_frames and not _limit_reached():
-                mic_frame = mic_frames.popleft()
-                system_frame = system_frames.popleft()
-                mixed_samples, mixed_rate = mix_audio_chunks(
-                    AudioChunk(
-                        samples=pcm16le_to_float32(mic_frame.pcm_bytes),
-                        sample_rate_hz=mic_frame.sample_rate_hz,
-                        channels=mic_frame.channels,
-                    ),
-                    AudioChunk(
-                        samples=pcm16le_to_float32(system_frame.pcm_bytes),
-                        sample_rate_hz=system_frame.sample_rate_hz,
-                        channels=system_frame.channels,
-                    ),
-                    resync_state=mixed_resync_state,
-                )
-                _ingest_pcm_for_notes(
-                    mono_frame_to_pcm16le(
-                        MonoAudioFrame(samples=tuple(mixed_samples), sample_rate_hz=mixed_rate)
-                    ),
-                    mixed_rate,
-                    1,
-                    now_monotonic=now_monotonic,
-                )
-                ingested += 1
-            if not allow_unpaired_mixed:
-                return ingested
-
-            def _silence_frame_like(frame: CapturedFrame) -> CapturedFrame:
-                return CapturedFrame(
-                    pcm_bytes=bytes(len(frame.pcm_bytes)),
-                    sample_rate_hz=frame.sample_rate_hz,
-                    channels=frame.channels,
-                )
-
-            while (mic_frames or system_frames) and not _limit_reached():
-                maybe_mic_frame = mic_frames.popleft() if mic_frames else None
-                maybe_system_frame = system_frames.popleft() if system_frames else None
-                if maybe_mic_frame is None and maybe_system_frame is None:
-                    break
-                if maybe_mic_frame is None:
-                    assert maybe_system_frame is not None
-                    maybe_mic_frame = _silence_frame_like(maybe_system_frame)
-                if maybe_system_frame is None:
-                    assert maybe_mic_frame is not None
-                    maybe_system_frame = _silence_frame_like(maybe_mic_frame)
-                mixed_samples, mixed_rate = mix_audio_chunks(
-                    AudioChunk(
-                        samples=pcm16le_to_float32(maybe_mic_frame.pcm_bytes),
-                        sample_rate_hz=maybe_mic_frame.sample_rate_hz,
-                        channels=maybe_mic_frame.channels,
-                    ),
-                    AudioChunk(
-                        samples=pcm16le_to_float32(maybe_system_frame.pcm_bytes),
-                        sample_rate_hz=maybe_system_frame.sample_rate_hz,
-                        channels=maybe_system_frame.channels,
-                    ),
-                    resync_state=mixed_resync_state,
-                )
-                _ingest_pcm_for_notes(
-                    mono_frame_to_pcm16le(
-                        MonoAudioFrame(samples=tuple(mixed_samples), sample_rate_hz=mixed_rate)
-                    ),
-                    mixed_rate,
-                    1,
-                    now_monotonic=now_monotonic,
-                )
-                ingested += 1
-            return ingested
         return ingested
 
     def _current_capture_elapsed_seconds(*, now_monotonic: float) -> float:
@@ -1112,10 +1039,10 @@ def _run_tty_notes_first(
         _raise_for_forced_shutdown_if_needed()
 
     try:
-        if config.mode in {"mic", "mixed"} and mic_device is not None:
+        if config.mode == "mic" and mic_device is not None:
             mic_capture = open_mic_capture(device=mic_device)
             mic_queue = queue.Queue()
-        if config.mode in {"system", "mixed"} and system_device is not None:
+        if config.mode == "system" and system_device is not None:
             system_capture = open_system_capture(
                 device=system_device,
                 all_devices=all_devices,
@@ -1429,7 +1356,6 @@ def _run_tty_notes_first(
                 system_frames=system_pending_final,
                 now_monotonic=now_monotonic,
                 max_frames=_SHUTDOWN_INGEST_MAX_FRAMES_PER_CYCLE,
-                allow_unpaired_mixed=True,
             )
 
             queued_tasks = 0
@@ -1632,7 +1558,7 @@ def devices_command(
 
 @app.command("start")
 def start_command(
-    mode: str | None = typer.Option(None, "--mode", help="mic|system|mixed"),
+    mode: str | None = typer.Option(None, "--mode", help="mic|system"),
     mic: str | None = typer.Option(None, "--mic", help="Device ID or name for microphone input."),
     system: str | None = typer.Option(
         None, "--system", help="Device ID or name for system output/loopback."
@@ -1823,20 +1749,56 @@ def start_command(
         typer.echo(message)
 
     selected_engine: str = config.engine
-    if preflight.recommended_engine is not None and preflight.recommended_engine != config.engine:
-        selected_engine = preflight.recommended_engine
-        typer.echo(f"Switching to {selected_engine} based on available local models.")
 
-    engine_instance = build_engine(
-        selected_engine,
-        faster_whisper_model_dir=config.model_dir_faster_whisper,
-        whisper_cpp_model_dir=config.model_dir_whisper_cpp,
-    )
+    def _build_selected_engine(engine_name: str) -> AsrEngine:
+        return build_engine(
+            engine_name,
+            faster_whisper_model_dir=config.model_dir_faster_whisper,
+            whisper_cpp_model_dir=config.model_dir_whisper_cpp,
+        )
+
+    engine_instance = _build_selected_engine(selected_engine)
     if not engine_instance.is_available() and sys.stdin.isatty():
         raise typer.BadParameter(
             f"Selected engine '{selected_engine}' is unavailable. "
             "Install dependencies or pipe text input for dry run."
         )
+
+    if engine_instance.is_available():
+        try:
+            ensure_engine_model_available(
+                engine_name=selected_engine,
+                model_name=config.model,
+                faster_whisper_model_dir=config.model_dir_faster_whisper,
+                whisper_cpp_model_dir=config.model_dir_whisper_cpp,
+                emit=typer.echo,
+            )
+        except ModelPreparationError as exc:
+            fallback_engine = preflight.recommended_engine
+            if fallback_engine is None or fallback_engine == selected_engine:
+                raise typer.BadParameter(str(exc)) from exc
+            typer.echo(f"Warning: {exc}", err=True)
+            typer.echo(
+                f"Switching to {fallback_engine} because selected engine model preparation failed."
+            )
+            selected_engine = fallback_engine
+            engine_instance = _build_selected_engine(selected_engine)
+            if not engine_instance.is_available() and sys.stdin.isatty():
+                raise typer.BadParameter(
+                    f"Selected engine '{selected_engine}' is unavailable. "
+                    "Install dependencies or pipe text input for dry run."
+                ) from exc
+            if engine_instance.is_available():
+                try:
+                    ensure_engine_model_available(
+                        engine_name=selected_engine,
+                        model_name=config.model,
+                        faster_whisper_model_dir=config.model_dir_faster_whisper,
+                        whisper_cpp_model_dir=config.model_dir_whisper_cpp,
+                        emit=typer.echo,
+                    )
+                except ModelPreparationError as fallback_exc:
+                    raise typer.BadParameter(str(fallback_exc)) from fallback_exc
 
     gate_state = ConfidenceGate(config.confidence_threshold)
     engine_available = engine_instance.is_available()
@@ -1855,7 +1817,6 @@ def start_command(
     running_server: RunningTranscriptServer | None = None
     mic_capture = None
     system_capture = None
-    mixed_resync_state = DriftResyncState()
     performance = RuntimePerformance()
     stopped_by_user = False
     shutdown_signals = _ShutdownSignalController()
@@ -1912,7 +1873,6 @@ def start_command(
                         writer=writer,
                         performance=performance,
                         started_at=started_at,
-                        mixed_resync_state=mixed_resync_state,
                         shutdown_signals=shutdown_signals,
                     )
                 if stopped_by_user:
@@ -1920,9 +1880,9 @@ def start_command(
                 return
             audio_chunker = OverlapChunker(chunk_duration_s=2.0, overlap_duration_s=0.5)
             if sys.stdin.isatty():
-                if config.mode in {"mic", "mixed"} and mic_device is not None:
+                if config.mode == "mic" and mic_device is not None:
                     mic_capture = open_mic_capture(device=mic_device)
-                if config.mode in {"system", "mixed"} and system_device is not None:
+                if config.mode == "system" and system_device is not None:
                     system_capture = open_system_capture(
                         device=system_device,
                         all_devices=all_devices,
@@ -2031,40 +1991,6 @@ def start_command(
                                         system_frame.channels,
                                     )
                                 )
-                        elif (
-                            config.mode == "mixed"
-                            and mic_capture is not None
-                            and system_capture is not None
-                        ):
-                            while mic_pending and system_pending:
-                                mic_frame = mic_pending.popleft()
-                                system_frame = system_pending.popleft()
-                                mixed_samples, mixed_rate = mix_audio_chunks(
-                                    AudioChunk(
-                                        samples=pcm16le_to_float32(mic_frame.pcm_bytes),
-                                        sample_rate_hz=mic_frame.sample_rate_hz,
-                                        channels=mic_frame.channels,
-                                    ),
-                                    AudioChunk(
-                                        samples=pcm16le_to_float32(system_frame.pcm_bytes),
-                                        sample_rate_hz=system_frame.sample_rate_hz,
-                                        channels=system_frame.channels,
-                                    ),
-                                    resync_state=mixed_resync_state,
-                                )
-                                audio_windows.extend(
-                                    audio_chunker.ingest(
-                                        mono_frame_to_pcm16le(
-                                            MonoAudioFrame(
-                                                samples=tuple(mixed_samples),
-                                                sample_rate_hz=mixed_rate,
-                                            )
-                                        ),
-                                        mixed_rate,
-                                        1,
-                                    )
-                                )
-
                         _transcribe_audio_windows(
                             audio_windows=audio_windows,
                             engine_available=engine_available,
