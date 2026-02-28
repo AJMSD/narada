@@ -21,6 +21,7 @@ from narada.cli import app, start_command
 from narada.config import RuntimeConfig
 from narada.devices import AudioDevice
 from narada.live_notes import SessionSpool as LiveSessionSpool
+from narada.setup.assistant import StartSetupResult
 
 
 class _TTYStdin:
@@ -259,6 +260,10 @@ def _stub_model_prepare(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "narada.cli.ensure_engine_model_available",
         lambda **_kwargs: Path("cached-model"),
+    )
+    monkeypatch.setattr(
+        "narada.cli.prepare_start_setup",
+        lambda **_kwargs: StartSetupResult(runtime_ready=True, loopback_ready=True),
     )
 
 

@@ -39,6 +39,38 @@ def test_whisper_cpp_is_available_with_cli() -> None:
     assert engine.is_available()
 
 
+def test_whisper_cpp_is_available_with_whisper_cpp_binary_only() -> None:
+    engine = WhisperCppEngine(
+        which_fn=lambda name: "whisper-cpp" if name == "whisper-cpp" else None
+    )
+    assert engine.is_available()
+
+
+def test_whisper_cpp_transcribe_uses_whisper_cpp_binary_when_whisper_cli_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(
+        help_text="usage: whisper-cpp ... --no-gpu ... cuda metal",
+        command_sink=captured_cmds,
+    )
+    engine = WhisperCppEngine(
+        which_fn=lambda name: "whisper-cpp" if name == "whisper-cpp" else None,
+        run_fn=fake_run,
+    )
+    result = engine.transcribe(_request("cpu"))
+
+    assert result[0].text == "ok"
+    assert captured_cmds
+    assert captured_cmds[0][0] == "whisper-cpp"
+
+
 def test_whisper_cpp_transcribe_cpu_uses_no_gpu_flag_without_numeric_layers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

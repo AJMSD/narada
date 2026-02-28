@@ -70,13 +70,13 @@ class WhisperCppEngine:
         self._model_directory = model_directory
 
     def is_available(self) -> bool:
-        return self._which_fn("whisper-cli") is not None
+        return self._resolve_cli_path() is not None
 
     def transcribe(self, request: TranscriptionRequest) -> Sequence[TranscriptSegment]:
         if not self.is_available():
             raise EngineUnavailableError(
                 "whisper.cpp runtime is not available. Install whisper.cpp and ensure "
-                "'whisper-cli' is available on PATH."
+                "'whisper-cli' or 'whisper-cpp' is available on PATH."
             )
         if request.sample_rate_hz <= 0:
             raise ValueError("sample_rate_hz must be positive.")
@@ -253,10 +253,11 @@ class WhisperCppEngine:
         return tuple(detected)
 
     def probe_cli_capabilities(self) -> WhisperCliCapabilities:
-        cli_path = self._which_fn("whisper-cli")
+        cli_path = self._resolve_cli_path()
         if cli_path is None:
             raise EngineUnavailableError(
-                "whisper-cli binary not found on PATH. Install whisper.cpp CLI for transcription."
+                "whisper.cpp CLI binary not found on PATH. "
+                "Install whisper.cpp CLI for transcription."
             )
         with self._cache_lock:
             cached = self._capability_cache.get(cli_path)
@@ -324,10 +325,11 @@ class WhisperCppEngine:
             if cached is not None:
                 return cached
 
-        cli_path = self._which_fn("whisper-cli")
+        cli_path = self._resolve_cli_path()
         if cli_path is None:
             raise EngineUnavailableError(
-                "whisper-cli binary not found on PATH. Install whisper.cpp CLI for transcription."
+                "whisper.cpp CLI binary not found on PATH. "
+                "Install whisper.cpp CLI for transcription."
             )
         model_path = self._resolve_model_path(model_name)
         capabilities = self.probe_cli_capabilities()
@@ -365,6 +367,13 @@ class WhisperCppEngine:
             handle.read(4096)
         with cls._cache_lock:
             cls._warmed.add(key)
+
+    def _resolve_cli_path(self) -> str | None:
+        for candidate in ("whisper-cli", "whisper-cpp"):
+            resolved = self._which_fn(candidate)
+            if resolved is not None:
+                return resolved
+        return None
 
     @staticmethod
     def _write_pcm_to_wav(output_path: Path, pcm_bytes: bytes, sample_rate_hz: int) -> None:

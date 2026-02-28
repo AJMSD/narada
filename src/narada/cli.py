@@ -66,6 +66,7 @@ from narada.server import (
     serve_transcript_file,
     start_transcript_server,
 )
+from narada.setup.assistant import TeardownStep, prepare_start_setup, run_setup_teardown
 from narada.start_runtime import mono_frame_to_pcm16le, parse_input_line
 from narada.writer import TranscriptWriter
 
@@ -1729,14 +1730,53 @@ def start_command(
 
     try:
         config = build_runtime_config(overrides)
-        mic_device, system_device, all_devices = _resolve_selected_devices(
-            config.mode, config.mic, config.system
-        )
     except ConfigError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+    setup_teardown_steps: tuple[TeardownStep, ...] = ()
+    system_selector = config.system
+    setup_result = prepare_start_setup(
+        mode=config.mode,
+        engine_name=config.engine,
+        system_selector=system_selector,
+        interactive=sys.stdin.isatty(),
+        emit=typer.echo,
+        confirm=lambda prompt: bool(typer.confirm(prompt, default=True)),
+    )
+    if not setup_result.ok:
+        if setup_result.teardown_steps:
+            run_setup_teardown(
+                steps=setup_result.teardown_steps,
+                emit=lambda message: _safe_echo(message, err=True),
+            )
+        raise typer.BadParameter(setup_result.message or "Automatic setup failed.")
+    if setup_result.system_selector_override is not None:
+        system_selector = setup_result.system_selector_override
+        typer.echo(
+            "Using temporary system capture device selector: "
+            f"{setup_result.system_selector_override}"
+        )
+    setup_teardown_steps = setup_result.teardown_steps
+
+    try:
+        mic_device, system_device, all_devices = _resolve_selected_devices(
+            config.mode, config.mic, system_selector
+        )
     except AmbiguousDeviceError as exc:
+        if setup_teardown_steps:
+            run_setup_teardown(
+                steps=setup_teardown_steps,
+                emit=lambda message: _safe_echo(message, err=True),
+            )
+            setup_teardown_steps = ()
         raise typer.BadParameter(str(exc)) from exc
     except DeviceResolutionError as exc:
+        if setup_teardown_steps:
+            run_setup_teardown(
+                steps=setup_teardown_steps,
+                emit=lambda message: _safe_echo(message, err=True),
+            )
+            setup_teardown_steps = ()
         raise typer.BadParameter(str(exc)) from exc
 
     model_discovery = discover_models(
@@ -2171,6 +2211,11 @@ def start_command(
             system_capture.close()
         if running_server is not None:
             running_server.stop()
+        if setup_teardown_steps:
+            run_setup_teardown(
+                steps=setup_teardown_steps,
+                emit=lambda message: _safe_echo(message, err=True),
+            )
     if stopped_by_user:
         typer.echo("\nStopped.")
 

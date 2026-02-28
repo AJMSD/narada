@@ -47,7 +47,8 @@ Narada supports two engine adapters from the start:
 - `faster-whisper`
 - `whisper-cpp`
 
-`whisper-cpp` runtime requires the `whisper-cli` binary available on your `PATH`.
+`whisper-cpp` runtime requires a whisper.cpp CLI binary on `PATH`
+(`whisper-cli` or `whisper-cpp`).
 
 Select engine with:
 ```bash
@@ -77,11 +78,20 @@ One-time setup behavior:
 - If selected-engine download fails and another engine already has local model files, Narada falls back to that local engine for the run.
 - Once model files are present locally, runs are offline unless you choose to fetch/update models.
 
+Start-time setup assistant behavior:
+- In interactive (`TTY`) runs, Narada can prompt to install missing `whisper-cpp` runtime (`python -m pip install "whisper.cpp-cli>=0.0.3"`).
+- In interactive `--mode system` runs, Narada can prompt for OS-specific prerequisite setup:
+  - Windows: best-effort dependency remediation (PyAudioWPatch install only).
+  - Linux: session-only `pactl` loopback setup and automatic cleanup on exit.
+  - macOS: optional `brew install --cask blackhole-2ch` attempt.
+- In non-interactive runs, Narada does not auto-install and instead exits with actionable guidance.
+
 ## Limitations
 - System-audio capture depends on OS and backend support. On Windows, Narada uses `PyAudioWPatch` and WASAPI loopback sources; channel count is detected at runtime and downmixed to mono before transcription, with fallback through common values when needed.
 - Windows live capture (`--mode mic`, `--mode system`) requires `PyAudioWPatch`.
 - Bluetooth HFP devices (Hands-Free Profile) do not expose a standard PCM loopback endpoint on Windows and will produce a descriptive error. If your driver exposes **Stereo Mix**, use it as an input path (`narada start --mode mic --mic <stereo-mix-id>`).
-- macOS system capture usually requires a virtual loopback device (for example BlackHole).
+- macOS system capture requires a virtual loopback device (for example BlackHole) and output routing through that device.
+- Linux auto-loopback setup is session-scoped; if your environment blocks `pactl` operations, use manual PipeWire/PulseAudio monitor routing.
 - ASR runtime availability depends on optional dependencies being installed.
 - Current scaffold focuses on stable interfaces, validation, and quality gates while real-time capture integrations are expanded.
 - Redaction is regex-based and best effort. False positives and false negatives are possible.

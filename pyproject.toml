@@ -20,7 +20,8 @@ dependencies = [
 asr = [
   "faster-whisper>=1.1.0",
   "huggingface-hub>=0.24.0",
-  "whispercpp>=0.0.18",
+  "whispercpp>=0.0.17",
+  "whisper.cpp-cli>=0.0.3",
 ]
 audio = [
   "sounddevice>=0.4.7; platform_system != 'Windows'",
