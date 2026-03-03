@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -60,6 +62,19 @@ INDEX_HTML = """<!doctype html>
 """
 
 
+def _is_expected_disconnect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+
+    if exc.errno in {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED}:
+        return True
+
+    winerror = getattr(exc, "winerror", None)
+    return isinstance(winerror, int) and winerror in {10053, 10054}
+
+
 class TranscriptHTTPServer(ThreadingHTTPServer):
     transcript_path: Path
     stop_event: threading.Event
@@ -77,6 +92,16 @@ class TranscriptHTTPServer(ThreadingHTTPServer):
         self.transcript_path = transcript_path
         self.stop_event = stop_event
         self.serve_token = serve_token
+
+    def handle_error(
+        self,
+        request: socket.socket | tuple[bytes, socket.socket],
+        client_address: tuple[str, int],
+    ) -> None:
+        _, exc_value, _ = sys.exc_info()
+        if exc_value is not None and _is_expected_disconnect_error(exc_value):
+            return
+        super().handle_error(request, client_address)
 
 
 class TranscriptHandler(BaseHTTPRequestHandler):
