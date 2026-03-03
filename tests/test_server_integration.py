@@ -224,3 +224,67 @@ def test_start_transcript_server_helper_includes_token_in_access_url(tmp_path: P
         assert "line-one" in body
     finally:
         running.stop()
+
+
+def test_server_handle_error_suppresses_expected_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "session.txt"
+    transcript_path.write_text("line-one\n", encoding="utf-8")
+    server = TranscriptHTTPServer(
+        ("127.0.0.1", 0),
+        TranscriptHandler,
+        transcript_path,
+        threading.Event(),
+        None,
+    )
+    delegated = {"count": 0}
+
+    def _record_delegate(
+        self: TranscriptHTTPServer, request: object, client_address: object
+    ) -> None:
+        _ = (self, request, client_address)
+        delegated["count"] += 1
+
+    monkeypatch.setattr("narada.server.ThreadingHTTPServer.handle_error", _record_delegate)
+    try:
+        try:
+            raise ConnectionResetError(10054, "connection reset")
+        except ConnectionResetError:
+            server.handle_error(object(), ("127.0.0.1", 9000))
+        assert delegated["count"] == 0
+    finally:
+        server.server_close()
+
+
+def test_server_handle_error_delegates_unexpected_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "session.txt"
+    transcript_path.write_text("line-one\n", encoding="utf-8")
+    server = TranscriptHTTPServer(
+        ("127.0.0.1", 0),
+        TranscriptHandler,
+        transcript_path,
+        threading.Event(),
+        None,
+    )
+    delegated = {"count": 0}
+
+    def _record_delegate(
+        self: TranscriptHTTPServer, request: object, client_address: object
+    ) -> None:
+        _ = (self, request, client_address)
+        delegated["count"] += 1
+
+    monkeypatch.setattr("narada.server.ThreadingHTTPServer.handle_error", _record_delegate)
+    try:
+        try:
+            raise RuntimeError("unexpected failure")
+        except RuntimeError:
+            server.handle_error(object(), ("127.0.0.1", 9001))
+        assert delegated["count"] == 1
+    finally:
+        server.server_close()

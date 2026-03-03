@@ -187,6 +187,31 @@ def test_maybe_warn_capture_backlog_ignores_values_below_threshold(
     assert echoed == []
 
 
+def test_maybe_warn_capture_backlog_suppresses_line_and_log_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    echoed: list[str] = []
+    warned: list[str] = []
+    monkeypatch.setattr("narada.cli._safe_echo", lambda message, **_kwargs: echoed.append(message))
+    monkeypatch.setattr("narada.cli.logger.warning", lambda message: warned.append(message))
+
+    warn_at = _maybe_warn_capture_backlog(
+        source_name="system",
+        queued_frames=200,
+        blocksize=1600,
+        sample_rate_hz=16000,
+        warn_threshold_s=10.0,
+        now_monotonic=50.0,
+        last_warned_at=None,
+        emit_line_warning=False,
+        emit_log_warning=False,
+    )
+
+    assert warn_at == 50.0
+    assert echoed == []
+    assert warned == []
+
+
 def test_estimate_asr_backlog_seconds_combines_planner_and_queue() -> None:
     backlog = _estimate_asr_backlog_seconds(
         planner_backlog_s=5.0,
@@ -234,6 +259,28 @@ def test_maybe_warn_asr_backlog_warns_and_throttles(monkeypatch: pytest.MonkeyPa
     )
     assert third_warn == 131.0
     assert len(warned) == 2
+
+
+def test_maybe_warn_asr_backlog_suppresses_line_and_log_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    echoed: list[str] = []
+    warned: list[str] = []
+    monkeypatch.setattr("narada.cli._safe_echo", lambda message, **_kwargs: echoed.append(message))
+    monkeypatch.setattr("narada.cli.logger.warning", lambda message: warned.append(message))
+
+    warn_at = _maybe_warn_asr_backlog(
+        backlog_s=60.0,
+        warn_threshold_s=45.0,
+        now_monotonic=70.0,
+        last_warned_at=None,
+        emit_line_warning=False,
+        emit_log_warning=False,
+    )
+
+    assert warn_at == 70.0
+    assert echoed == []
+    assert warned == []
 
 
 def test_estimate_shutdown_eta_uses_realtime_factor() -> None:
@@ -444,6 +491,7 @@ def test_maybe_warn_asr_backlog_breaks_single_line_when_renderer_provided(
         warn_threshold_s=45.0,
         now_monotonic=10.0,
         last_warned_at=None,
+        emit_line_warning=True,
         status_renderer=renderer,  # type: ignore[arg-type]
     )
 

@@ -1088,7 +1088,7 @@ def test_start_compacts_single_line_status_for_narrow_tty(
     assert "narrow tty transcript" in out_path.read_text(encoding="utf-8")
 
 
-def test_start_breaks_single_line_before_backlog_warning_output(
+def test_start_backlog_warnings_render_in_status_without_warning_lines(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -1103,9 +1103,6 @@ def test_start_breaks_single_line_before_backlog_warning_output(
     slow_engine = _SlowEngine("warning separation transcript", delay_s=0.03)
     system_capture = _FakeCapture(frames=[_frame() for _ in range(256)])
     stream = _TTYStdoutBuffer()
-
-    def _warning_to_stdout(message: str, *_args: Any, **_kwargs: Any) -> None:
-        stream.write(f"WARNING {message}\n")
 
     monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
     monkeypatch.setattr(
@@ -1126,14 +1123,13 @@ def test_start_breaks_single_line_before_backlog_warning_output(
     monkeypatch.setattr("narada.cli.open_system_capture", lambda *_args, **_kwargs: system_capture)
     monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
     monkeypatch.setattr("narada.cli.sys.stdout", stream)
-    monkeypatch.setattr("narada.cli.logger.warning", _warning_to_stdout)
     monkeypatch.setattr("narada.cli._resolve_terminal_columns", lambda **_kwargs: 110)
     monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls(limit=5))
 
     _run_start_for_tests()
 
-    assert "WARNING Warning: ASR backlog is" in stream.output
-    assert "state=capturingWARNING" not in stream.output
+    assert "Warning: ASR backlog is" not in stream.output
+    assert "warn=asr" in stream.output
     assert "warning separation transcript" in out_path.read_text(encoding="utf-8")
 
 

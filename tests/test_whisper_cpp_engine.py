@@ -1,3 +1,4 @@
+import logging
 import subprocess
 from pathlib import Path
 
@@ -248,3 +249,33 @@ def test_whisper_cpp_timeout_on_cuda_retries_with_cpu_args(
     assert len(transcribe_cmds) == 2
     assert "--no-gpu" not in transcribe_cmds[0]
     assert "--no-gpu" in transcribe_cmds[1]
+
+
+def test_whisper_cpp_compute_resolution_logs_only_at_debug(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(
+        help_text="usage: whisper-cli ... --no-gpu ... cuda metal",
+        command_sink=captured_cmds,
+    )
+
+    info_engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+    with caplog.at_level(logging.INFO, logger="narada.asr.whisper_cpp"):
+        _ = info_engine.transcribe(_request("cpu"))
+    assert "whisper.cpp compute resolved" not in caplog.text
+
+    caplog.clear()
+    WhisperCppEngine.clear_cache_for_tests()
+    debug_engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+    with caplog.at_level(logging.DEBUG, logger="narada.asr.whisper_cpp"):
+        _ = debug_engine.transcribe(_request("cpu"))
+    assert any("whisper.cpp compute resolved" in record.getMessage() for record in caplog.records)
