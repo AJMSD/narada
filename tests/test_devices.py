@@ -56,6 +56,26 @@ def test_resolve_combo_device_for_output_chooses_system_endpoint(
     assert resolved.type == "output"
 
 
+def test_resolve_combo_device_for_output_preserves_hostapi() -> None:
+    devices = [
+        AudioDevice(
+            id=2,
+            name="Conference Headset",
+            type="input/output",
+            hostapi="Windows WASAPI",
+            input_device_id=22,
+            system_device_id=32,
+            system_device_type="output",
+        )
+    ]
+
+    resolved = resolve_device("2", devices, {"output", "loopback", "monitor"})
+
+    assert resolved.id == 32
+    assert resolved.type == "output"
+    assert resolved.hostapi == "Windows WASAPI"
+
+
 def test_resolve_output_only_for_input_rejected(sample_devices: list[AudioDevice]) -> None:
     with pytest.raises(DeviceResolutionError):
         resolve_device("Loopback Cable", sample_devices, {"input"})
@@ -176,6 +196,46 @@ def test_curate_wasapi_default_still_wins_over_mme_default() -> None:
     curated = curate_devices(raw, os_name="windows")
     assert len(curated) == 1
     assert curated[0].id == 20
+
+
+def test_curate_passthrough_output_preserves_hostapi() -> None:
+    raw = [
+        AudioDevice(
+            id=20,
+            name="Headphones (Realtek Audio)",
+            type="output",
+            hostapi="Windows WASAPI",
+            system_device_id=20,
+            system_device_type="output",
+        )
+    ]
+    curated = curate_devices(raw, os_name="windows")
+    assert len(curated) == 1
+    assert curated[0].hostapi == "Windows WASAPI"
+
+
+def test_curate_logical_input_output_prefers_output_hostapi() -> None:
+    raw = [
+        AudioDevice(
+            id=12,
+            name="Microphone (Conference Headset)",
+            type="input",
+            hostapi="Windows WDM-KS",
+            input_device_id=12,
+        ),
+        AudioDevice(
+            id=20,
+            name="Headphones (Conference Headset)",
+            type="output",
+            hostapi="Windows WASAPI",
+            system_device_id=20,
+            system_device_type="output",
+        ),
+    ]
+    curated = curate_devices(raw, os_name="windows")
+    assert len(curated) == 1
+    assert curated[0].type == "input/output"
+    assert curated[0].hostapi == "Windows WASAPI"
 
 
 def test_curate_prefers_wasapi_over_directsound_over_mme() -> None:

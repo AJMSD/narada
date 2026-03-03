@@ -272,12 +272,105 @@ def test_windows_system_setup_installs_pyaudiowpatch(monkeypatch: pytest.MonkeyP
                 system_device_type="output",
             )
         ],
+        enumerate_all_devices_fn=lambda: [
+            AudioDevice(
+                id=1,
+                name="Speakers",
+                type="output",
+                hostapi="Windows WASAPI",
+                system_device_id=1,
+                system_device_type="output",
+            )
+        ],
         python_executable="python",
     )
 
     assert result.succeeded
     assert result.performed
     assert ("python", "-m", "pip", "install", "PyAudioWPatch>=0.2.12.8") in commands
+    assert teardown_steps == ()
+    assert selector_override is None
+
+
+def test_windows_system_readiness_uses_raw_wasapi_devices_when_curated_hostapi_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("narada.setup.assistant.windows.loopback_support_error", lambda: None)
+
+    result, teardown_steps, selector_override = ensure_system_capture_prereqs(
+        os_name="windows",
+        mode="system",
+        system_selector="20",
+        interactive=False,
+        emit=lambda _message: None,
+        confirm=lambda _prompt: True,
+        run_command=lambda _command: CommandResult(returncode=0, stdout="", stderr=""),
+        enumerate_devices_fn=lambda: [
+            AudioDevice(
+                id=20,
+                name="Headphones (Realtek Audio)",
+                type="output",
+                hostapi=None,
+                system_device_id=20,
+                system_device_type="output",
+            )
+        ],
+        enumerate_all_devices_fn=lambda: [
+            AudioDevice(
+                id=20,
+                name="Headphones (Realtek Audio)",
+                type="output",
+                hostapi="Windows WASAPI",
+                system_device_id=20,
+                system_device_type="output",
+            )
+        ],
+    )
+
+    assert result.succeeded
+    assert not result.performed
+    assert teardown_steps == ()
+    assert selector_override is None
+
+
+def test_windows_system_readiness_handles_logical_input_output_with_raw_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("narada.setup.assistant.windows.loopback_support_error", lambda: None)
+
+    result, teardown_steps, selector_override = ensure_system_capture_prereqs(
+        os_name="windows",
+        mode="system",
+        system_selector="21",
+        interactive=False,
+        emit=lambda _message: None,
+        confirm=lambda _prompt: True,
+        run_command=lambda _command: CommandResult(returncode=0, stdout="", stderr=""),
+        enumerate_devices_fn=lambda: [
+            AudioDevice(
+                id=21,
+                name="Conference Headset",
+                type="input/output",
+                hostapi=None,
+                input_device_id=11,
+                system_device_id=20,
+                system_device_type="output",
+            )
+        ],
+        enumerate_all_devices_fn=lambda: [
+            AudioDevice(
+                id=20,
+                name="Headphones (Conference Headset)",
+                type="output",
+                hostapi="Windows WASAPI",
+                system_device_id=20,
+                system_device_type="output",
+            )
+        ],
+    )
+
+    assert result.succeeded
+    assert not result.performed
     assert teardown_steps == ()
     assert selector_override is None
 
