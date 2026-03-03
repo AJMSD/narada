@@ -549,6 +549,8 @@ def _maybe_warn_capture_backlog(
     warn_threshold_s: float,
     now_monotonic: float,
     last_warned_at: float | None,
+    emit_line_warning: bool = True,
+    emit_log_warning: bool = True,
     status_renderer: _LiveStatusRenderer | None = None,
 ) -> float | None:
     backlog_s = _estimate_capture_backlog_seconds(
@@ -566,10 +568,12 @@ def _maybe_warn_capture_backlog(
         f"Warning: {source_name} capture backlog is {backlog_s:.1f}s "
         f"({queued_frames} queued frames). ASR may be falling behind."
     )
-    if status_renderer is not None:
+    if emit_line_warning and status_renderer is not None:
         status_renderer.break_single_line()
-    logger.warning(message)
-    _safe_echo(message, err=True)
+    if emit_log_warning:
+        logger.warning(message)
+    if emit_line_warning:
+        _safe_echo(message, err=True)
     return now_monotonic
 
 
@@ -602,6 +606,8 @@ def _maybe_warn_asr_backlog(
     warn_threshold_s: float,
     now_monotonic: float,
     last_warned_at: float | None,
+    emit_line_warning: bool = False,
+    emit_log_warning: bool = True,
     status_renderer: _LiveStatusRenderer | None = None,
 ) -> float | None:
     if backlog_s < warn_threshold_s:
@@ -611,9 +617,12 @@ def _maybe_warn_asr_backlog(
     ):
         return last_warned_at
     message = f"Warning: ASR backlog is {backlog_s:.1f}s. Notes may lag behind live audio."
-    if status_renderer is not None:
+    if emit_line_warning and status_renderer is not None:
         status_renderer.break_single_line()
-    logger.warning(message)
+    if emit_log_warning:
+        logger.warning(message)
+    if emit_line_warning:
+        _safe_echo(message, err=True)
     return now_monotonic
 
 
@@ -936,6 +945,8 @@ def _run_tty_notes_first(
     def _render_live_status(
         *,
         asr_backlog_s: float,
+        asr_warning_active: bool = False,
+        capture_warning_active: bool = False,
         include_shutdown_notice: bool = False,
         now_monotonic: float | None = None,
     ) -> None:
@@ -955,7 +966,15 @@ def _run_tty_notes_first(
             f"asr={max(0.0, asr_backlog_s):.1f}s",
             f"state={status_state}",
         ]
+        warning_indicator: str | None = None
+        if asr_warning_active and capture_warning_active:
+            warning_indicator = "asr+cap"
+        elif asr_warning_active:
+            warning_indicator = "asr"
+        elif capture_warning_active:
+            warning_indicator = "cap"
         optional_fields = [
+            f"warn={warning_indicator}" if warning_indicator is not None else "",
             f"rtf={rtf_text}",
             f"commit={commit_text}",
             f"cap={performance.capture_backlog_s:.1f}s",
@@ -964,6 +983,7 @@ def _run_tty_notes_first(
             f"pend={max(0.0, pending_asr_audio_seconds):.1f}s",
             f"plan={planner_backlog_s:.1f}s",
         ]
+        optional_fields = [field for field in optional_fields if field]
         if include_shutdown_notice:
             shutdown_eta_s = _estimate_shutdown_eta_seconds(
                 asr_backlog_s=asr_backlog_s,
@@ -1182,14 +1202,17 @@ def _run_tty_notes_first(
                 processed_any = True
 
             capture_backlog_values: list[float] = []
+            capture_warning_active = False
             if mic_capture is not None and mic_queue is not None:
                 mic_queued_frames = mic_queue.qsize() + len(mic_pending)
-                capture_backlog_values.append(
-                    _estimate_capture_backlog_seconds(
-                        queued_frames=mic_queued_frames,
-                        blocksize=mic_capture.blocksize,
-                        sample_rate_hz=mic_capture.sample_rate_hz,
-                    )
+                mic_backlog_s = _estimate_capture_backlog_seconds(
+                    queued_frames=mic_queued_frames,
+                    blocksize=mic_capture.blocksize,
+                    sample_rate_hz=mic_capture.sample_rate_hz,
+                )
+                capture_backlog_values.append(mic_backlog_s)
+                capture_warning_active = (
+                    capture_warning_active or mic_backlog_s >= config.capture_queue_warn_seconds
                 )
                 last_capture_backlog_warning_at["mic"] = _maybe_warn_capture_backlog(
                     source_name="mic",
@@ -1199,16 +1222,20 @@ def _run_tty_notes_first(
                     warn_threshold_s=config.capture_queue_warn_seconds,
                     now_monotonic=now_monotonic,
                     last_warned_at=last_capture_backlog_warning_at["mic"],
+                    emit_line_warning=False,
+                    emit_log_warning=False,
                     status_renderer=status_renderer,
                 )
             if system_capture is not None and system_queue is not None:
                 system_queued_frames = system_queue.qsize() + len(system_pending)
-                capture_backlog_values.append(
-                    _estimate_capture_backlog_seconds(
-                        queued_frames=system_queued_frames,
-                        blocksize=system_capture.blocksize,
-                        sample_rate_hz=system_capture.sample_rate_hz,
-                    )
+                system_backlog_s = _estimate_capture_backlog_seconds(
+                    queued_frames=system_queued_frames,
+                    blocksize=system_capture.blocksize,
+                    sample_rate_hz=system_capture.sample_rate_hz,
+                )
+                capture_backlog_values.append(system_backlog_s)
+                capture_warning_active = (
+                    capture_warning_active or system_backlog_s >= config.capture_queue_warn_seconds
                 )
                 last_capture_backlog_warning_at["system"] = _maybe_warn_capture_backlog(
                     source_name="system",
@@ -1218,6 +1245,8 @@ def _run_tty_notes_first(
                     warn_threshold_s=config.capture_queue_warn_seconds,
                     now_monotonic=now_monotonic,
                     last_warned_at=last_capture_backlog_warning_at["system"],
+                    emit_line_warning=False,
+                    emit_log_warning=False,
                     status_renderer=status_renderer,
                 )
             capture_backlog_s = max(capture_backlog_values) if capture_backlog_values else 0.0
@@ -1225,11 +1254,14 @@ def _run_tty_notes_first(
                 planner_backlog_s=planner.pending_backlog_seconds(),
                 pending_asr_audio_s=pending_asr_audio_seconds,
             )
+            asr_warning_active = asr_backlog_s >= config.asr_backlog_warn_seconds
             last_asr_backlog_warning_at = _maybe_warn_asr_backlog(
                 backlog_s=asr_backlog_s,
                 warn_threshold_s=config.asr_backlog_warn_seconds,
                 now_monotonic=now_monotonic,
                 last_warned_at=last_asr_backlog_warning_at,
+                emit_line_warning=False,
+                emit_log_warning=False,
                 status_renderer=status_renderer,
             )
             performance.set_backlogs(
@@ -1244,7 +1276,12 @@ def _run_tty_notes_first(
             performance.set_dropped_frames(dropped_frames=dropped_frames)
 
             if now_monotonic >= next_status_at:
-                _render_live_status(asr_backlog_s=asr_backlog_s, now_monotonic=now_monotonic)
+                _render_live_status(
+                    asr_backlog_s=asr_backlog_s,
+                    asr_warning_active=asr_warning_active,
+                    capture_warning_active=capture_warning_active,
+                    now_monotonic=now_monotonic,
+                )
                 next_status_at = now_monotonic + 1.0
 
             if not processed_any:
@@ -1290,9 +1327,11 @@ def _run_tty_notes_first(
         def _render_shutdown_status() -> None:
             now_monotonic = time.monotonic()
             asr_backlog_s = _current_asr_backlog_seconds()
+            asr_warning_active = asr_backlog_s >= config.asr_backlog_warn_seconds
             performance.set_backlogs(capture_backlog_s=0.0, asr_backlog_s=asr_backlog_s)
             _render_live_status(
                 asr_backlog_s=asr_backlog_s,
+                asr_warning_active=asr_warning_active,
                 include_shutdown_notice=True,
                 now_monotonic=now_monotonic,
             )
