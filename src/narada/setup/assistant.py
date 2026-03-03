@@ -106,6 +106,7 @@ def _check_system_capture_readiness(
     os_name: str,
     selector: str | None,
     devices: Sequence[AudioDevice],
+    enumerate_all_devices_fn: Callable[[], list[AudioDevice]] | None = None,
 ) -> _SystemCaptureReadiness:
     try:
         selected_device = _resolve_selected_system_device(selector=selector, devices=devices)
@@ -114,7 +115,17 @@ def _check_system_capture_readiness(
 
     try:
         if os_name == "windows":
-            windows.resolve_system_capture_device(selected_device, devices)
+            devices_for_validation: Sequence[AudioDevice] = devices
+            if enumerate_all_devices_fn is not None:
+                raw_devices = enumerate_all_devices_fn()
+                if raw_devices:
+                    devices_for_validation = raw_devices
+            try:
+                windows.resolve_system_capture_device(selected_device, devices_for_validation)
+            except DeviceResolutionError:
+                if devices_for_validation is devices:
+                    raise
+                windows.resolve_system_capture_device(selected_device, devices)
             loopback_issue = windows.loopback_support_error()
             if loopback_issue is not None:
                 return _SystemCaptureReadiness(ready=False, message=loopback_issue)
@@ -270,6 +281,9 @@ def ensure_system_capture_prereqs(
     confirm: ConfirmPrompt,
     run_command: Callable[[Sequence[str]], CommandResult] = _run_command,
     enumerate_devices_fn: Callable[[], list[AudioDevice]] = enumerate_devices,
+    enumerate_all_devices_fn: Callable[[], list[AudioDevice]] = lambda: enumerate_devices(
+        include_all=True
+    ),
     python_executable: str = sys.executable,
 ) -> tuple[SetupActionResult, tuple[TeardownStep, ...], str | None]:
     if mode != "system":
@@ -283,7 +297,10 @@ def ensure_system_capture_prereqs(
 
     devices = enumerate_devices_fn()
     readiness = _check_system_capture_readiness(
-        os_name=os_name, selector=system_selector, devices=devices
+        os_name=os_name,
+        selector=system_selector,
+        devices=devices,
+        enumerate_all_devices_fn=enumerate_all_devices_fn if os_name == "windows" else None,
     )
     if readiness.ready:
         return (
@@ -337,7 +354,10 @@ def ensure_system_capture_prereqs(
                 )
             devices = enumerate_devices_fn()
             post = _check_system_capture_readiness(
-                os_name=os_name, selector=system_selector, devices=devices
+                os_name=os_name,
+                selector=system_selector,
+                devices=devices,
+                enumerate_all_devices_fn=enumerate_all_devices_fn if os_name == "windows" else None,
             )
             return (
                 SetupActionResult(
@@ -434,7 +454,9 @@ def ensure_system_capture_prereqs(
 
         devices = enumerate_devices_fn()
         post = _check_system_capture_readiness(
-            os_name=os_name, selector=system_selector, devices=devices
+            os_name=os_name,
+            selector=system_selector,
+            devices=devices,
         )
         if post.ready:
             return (
@@ -532,7 +554,9 @@ def ensure_system_capture_prereqs(
 
         devices = enumerate_devices_fn()
         post = _check_system_capture_readiness(
-            os_name=os_name, selector=system_selector, devices=devices
+            os_name=os_name,
+            selector=system_selector,
+            devices=devices,
         )
         return (
             SetupActionResult(
@@ -570,6 +594,9 @@ def prepare_start_setup(
     confirm: ConfirmPrompt,
     run_command: Callable[[Sequence[str]], CommandResult] = _run_command,
     enumerate_devices_fn: Callable[[], list[AudioDevice]] = enumerate_devices,
+    enumerate_all_devices_fn: Callable[[], list[AudioDevice]] = lambda: enumerate_devices(
+        include_all=True
+    ),
     python_executable: str = sys.executable,
     which_fn: Callable[[str], str | None] = shutil.which,
 ) -> StartSetupResult:
@@ -602,6 +629,7 @@ def prepare_start_setup(
         confirm=confirm,
         run_command=run_command,
         enumerate_devices_fn=enumerate_devices_fn,
+        enumerate_all_devices_fn=enumerate_all_devices_fn,
         python_executable=python_executable,
     )
     loopback_ready = loopback_result.succeeded
