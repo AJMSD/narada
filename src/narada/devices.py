@@ -408,6 +408,7 @@ def _build_logical_devices(endpoints: Sequence[AudioDevice]) -> list[AudioDevice
                 name=_choose_logical_name(input_endpoint.name, output_endpoint.name),
                 type="input/output",
                 is_default=input_endpoint.is_default or output_endpoint.is_default,
+                hostapi=output_endpoint.hostapi or input_endpoint.hostapi,
                 input_device_id=input_endpoint.input_device_id,
                 system_device_id=output_endpoint.system_device_id,
                 system_device_type=output_endpoint.system_device_type,
@@ -431,6 +432,7 @@ def _build_logical_devices(endpoints: Sequence[AudioDevice]) -> list[AudioDevice
                 name=endpoint.name,
                 type=logical_type,
                 is_default=endpoint.is_default,
+                hostapi=endpoint.hostapi,
                 input_device_id=endpoint.input_device_id,
                 system_device_id=endpoint.system_device_id,
                 system_device_type=endpoint.system_device_type,
@@ -511,6 +513,7 @@ def _materialize_selection(
             name=device.name,
             type="input",
             is_default=device.is_default,
+            hostapi=device.hostapi,
             input_device_id=device.input_device_id,
         )
 
@@ -521,6 +524,7 @@ def _materialize_selection(
             name=device.name,
             type=system_type,
             is_default=device.is_default,
+            hostapi=device.hostapi,
             system_device_id=device.system_device_id,
             system_device_type=cast(SystemDeviceType, system_type),
         )
