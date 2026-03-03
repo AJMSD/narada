@@ -144,7 +144,7 @@ class WhisperCppEngine:
                     break
                 except subprocess.TimeoutExpired as exc:
                     if attempt_idx == 0:
-                        logger.warning(
+                        logger.debug(
                             "whisper.cpp timed out after %.1fs on %s; retrying once on %s.",
                             timeout_s,
                             runtime.requested_compute,
@@ -277,7 +277,7 @@ class WhisperCppEngine:
                 break
 
         if not help_text:
-            logger.warning(
+            logger.debug(
                 "Could not read whisper-cli help output; "
                 "compute compatibility detection is limited."
             )
@@ -310,7 +310,7 @@ class WhisperCppEngine:
         if normalized == "cpu":
             if capabilities.no_gpu_flag is not None:
                 return (capabilities.no_gpu_flag,)
-            logger.warning(
+            logger.debug(
                 "whisper.cpp CLI does not advertise a no-GPU flag; compute=cpu "
                 "cannot be strictly enforced for this runtime."
             )
@@ -345,7 +345,7 @@ class WhisperCppEngine:
             ", ".join(capabilities.backend_hints) if capabilities.backend_hints else "unknown"
         )
         args_text = " ".join(compute_args) if compute_args else "<none>"
-        logger.info(
+        logger.debug(
             "whisper.cpp compute resolved: request=%s args=%s backend_hints=%s",
             normalized_compute,
             args_text,

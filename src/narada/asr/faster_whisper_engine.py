@@ -549,7 +549,7 @@ class FasterWhisperEngine:
             except (_GpuWorkerTimeoutError, _GpuWorkerExitError) as exc:
                 last_retryable_error = exc
                 if attempt_idx + 1 < max_attempts:
-                    logger.warning(
+                    logger.debug(
                         "ASR worker request failed (%s); retrying (%d/%d).",
                         exc,
                         attempt_idx + 1,
