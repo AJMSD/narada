@@ -41,6 +41,7 @@ class OverlapChunker:
         self.overlap_duration_s = overlap_duration_s
         self.min_flush_duration_s = min_flush_duration_s
         self._buffer = bytearray()
+        self._read_offset: int = 0
         self._sample_rate_hz: int | None = None
         self._channels: int | None = None
 
@@ -74,17 +75,18 @@ class OverlapChunker:
     def flush(self, force: bool = False) -> list[AudioChunkWindow]:
         if self._sample_rate_hz is None or self._channels is None:
             return []
-        if not self._buffer:
+        if self._read_offset >= len(self._buffer):
             return []
         if not force and self.pending_duration_s() < self.min_flush_duration_s:
             return []
 
         window = AudioChunkWindow(
-            pcm_bytes=bytes(self._buffer),
+            pcm_bytes=bytes(self._buffer[self._read_offset:]),
             sample_rate_hz=self._sample_rate_hz,
             channels=self._channels,
         )
         self._buffer.clear()
+        self._read_offset = 0
         return [window]
 
     def pending_duration_s(self) -> float:
@@ -93,7 +95,7 @@ class OverlapChunker:
         bytes_per_second = self._sample_rate_hz * self._channels * 2
         if bytes_per_second == 0:
             return 0.0
-        return len(self._buffer) / bytes_per_second
+        return (len(self._buffer) - self._read_offset) / bytes_per_second
 
     def _drain_ready_windows(self) -> list[AudioChunkWindow]:
         if self._sample_rate_hz is None or self._channels is None:
@@ -105,8 +107,9 @@ class OverlapChunker:
             raise ValueError("Invalid chunker stride; overlap must be smaller than chunk duration.")
 
         windows: list[AudioChunkWindow] = []
-        while len(self._buffer) >= chunk_bytes:
-            window_bytes = bytes(self._buffer[:chunk_bytes])
+        while len(self._buffer) - self._read_offset >= chunk_bytes:
+            start = self._read_offset
+            window_bytes = bytes(self._buffer[start : start + chunk_bytes])
             windows.append(
                 AudioChunkWindow(
                     pcm_bytes=window_bytes,
@@ -114,7 +117,10 @@ class OverlapChunker:
                     channels=self._channels,
                 )
             )
-            del self._buffer[:stride]
+            self._read_offset += stride
+        if self._read_offset >= chunk_bytes:
+            del self._buffer[: self._read_offset]
+            self._read_offset = 0
         return windows
 
 
