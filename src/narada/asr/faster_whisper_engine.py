@@ -79,6 +79,8 @@ _CPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET: dict[str, float] = {
     "accurate": 2.60,
 }
 
+_CPU_MULTILINGUAL_TIMEOUT_FACTOR: float = 1.4
+
 
 def _resolve_decode_preset(asr_preset: str | None) -> _DecodePreset:
     if asr_preset is None:
@@ -652,6 +654,7 @@ class FasterWhisperEngine:
                     device=device,
                     audio_seconds=chunk_seconds,
                     asr_preset=asr_preset,
+                    multilingual=multilingual,
                 )
                 chunk_payload = self._run_gpu_worker_request(
                     worker=worker,
@@ -674,6 +677,7 @@ class FasterWhisperEngine:
             device=device,
             audio_seconds=audio_seconds,
             asr_preset=asr_preset,
+            multilingual=multilingual,
         )
         return self._run_gpu_worker_request(
             worker=worker,
@@ -951,6 +955,7 @@ class FasterWhisperEngine:
         device: str,
         audio_seconds: float,
         asr_preset: str,
+        multilingual: bool = False,
     ) -> float:
         normalized = asr_preset.strip().lower()
         normalized_device = device.strip().lower()
@@ -969,6 +974,8 @@ class FasterWhisperEngine:
             normalized,
             _CPU_TIMEOUT_PER_AUDIO_SECOND_BY_PRESET["balanced"],
         )
+        if multilingual:
+            factor *= _CPU_MULTILINGUAL_TIMEOUT_FACTOR
         raw_timeout_s = cls._CPU_TRANSCRIBE_TIMEOUT_BASE_S + (max(0.0, audio_seconds) * factor)
         return min(
             cls._CPU_TRANSCRIBE_TIMEOUT_MAX_S,
