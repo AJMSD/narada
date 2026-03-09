@@ -77,6 +77,7 @@ class SessionSpool:
         self.data_path = self.directory / "audio.pcm16le"
         self.index_path = self.directory / "audio.idx"
         self._data_handle = self.data_path.open("wb")
+        self._read_handle = self.data_path.open("rb")
         self._index_handle = self.index_path.open("w", encoding="utf-8", newline="\n")
         self._index_handle.write("start_byte\tend_byte\tsample_rate_hz\tchannels\n")
         self._index_handle.flush()
@@ -156,9 +157,8 @@ class SessionSpool:
             if end_byte > self._cursor:
                 raise ValueError("Requested range exceeds spool size.")
             self._data_handle.flush()
-            with self.data_path.open("rb") as handle:
-                handle.seek(start_byte)
-                return handle.read(end_byte - start_byte)
+            self._read_handle.seek(start_byte)
+            return self._read_handle.read(end_byte - start_byte)
 
     def close(self) -> None:
         with self._lock:
@@ -169,6 +169,7 @@ class SessionSpool:
             self._index_handle.flush()
             os.fsync(self._index_handle.fileno())
             self._data_handle.close()
+            self._read_handle.close()
             self._index_handle.close()
             self._closed = True
 

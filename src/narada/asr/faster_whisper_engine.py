@@ -336,7 +336,7 @@ def _gpu_transcribe_worker_main(
         language = request.get("language")
         multilingual = bool(request.get("multilingual", False))
         asr_preset = request.get("asr_preset")
-        audio = np.frombuffer(bytes(request.get("audio", b"")), dtype=np.float32).copy()
+        audio = np.frombuffer(request.get("audio", b""), dtype=np.float32).copy()
 
         try:
             if probe:
@@ -1101,7 +1101,9 @@ class FasterWhisperEngine:
     @staticmethod
     def _pcm16le_to_float_array(pcm_bytes: bytes) -> np.ndarray[Any, np.dtype[np.float32]]:
         samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-        return (samples.astype(np.float32) / 32768.0).copy()
+        out = samples.astype(np.float32)
+        out /= 32768.0
+        return out
 
     @staticmethod
     def _confidence_from_segment(segment: Any) -> float:
