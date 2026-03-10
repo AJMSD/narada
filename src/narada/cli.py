@@ -62,6 +62,7 @@ from narada.pipeline import (
 from narada.redaction import redact_text
 from narada.server import (
     RunningTranscriptServer,
+    TranscriptEventBroadcaster,
     render_ascii_qr,
     serve_transcript_file,
     start_transcript_server,
@@ -469,6 +470,7 @@ def _write_committed_lines(
     config: RuntimeConfig,
     performance: RuntimePerformance,
     started_at: float,
+    event_broadcaster: TranscriptEventBroadcaster | None = None,
 ) -> None:
     for item in committed:
         text = cast(str, getattr(item, "text", "")).strip()
@@ -477,6 +479,8 @@ def _write_committed_lines(
         if config.redact:
             text = redact_text(text)
         writer.append_line(text)
+        if event_broadcaster is not None:
+            event_broadcaster.publish(text)
         performance.record_commit_latency(elapsed_seconds=time.perf_counter() - started_at)
 
 
@@ -490,6 +494,7 @@ def _transcribe_audio_windows(
     gate_state: ConfidenceGate,
     writer: TranscriptWriter,
     started_at: float,
+    event_broadcaster: TranscriptEventBroadcaster | None = None,
 ) -> None:
     if not audio_windows or not engine_available:
         return
@@ -509,6 +514,7 @@ def _transcribe_audio_windows(
         config=config,
         performance=performance,
         started_at=started_at,
+        event_broadcaster=event_broadcaster,
     )
 
 
@@ -722,6 +728,7 @@ def _drain_asr_results(
     performance: RuntimePerformance,
     started_at: float,
     status_renderer: _LiveStatusRenderer | None = None,
+    event_broadcaster: TranscriptEventBroadcaster | None = None,
 ) -> _AsrDrainSummary:
     drained = 0
     completed_audio_seconds = 0.0
@@ -761,6 +768,7 @@ def _drain_asr_results(
             config=config,
             performance=performance,
             started_at=started_at,
+            event_broadcaster=event_broadcaster,
         )
     return _AsrDrainSummary(
         drained_count=drained,
@@ -782,6 +790,7 @@ def _run_tty_notes_first(
     performance: RuntimePerformance,
     started_at: float,
     shutdown_signals: _ShutdownSignalController,
+    event_broadcaster: TranscriptEventBroadcaster | None = None,
 ) -> bool:
     stopped_by_user = False
     shutdown_reason = shutdown_signals.shutdown_reason
@@ -1177,6 +1186,7 @@ def _run_tty_notes_first(
                 performance=performance,
                 started_at=cycle_started_at,
                 status_renderer=status_renderer,
+                event_broadcaster=event_broadcaster,
             )
             if _apply_drain_summary(pre_drain_summary) > 0:
                 processed_any = True
@@ -1221,6 +1231,7 @@ def _run_tty_notes_first(
                 performance=performance,
                 started_at=cycle_started_at,
                 status_renderer=status_renderer,
+                event_broadcaster=event_broadcaster,
             )
             if _apply_drain_summary(post_drain_summary) > 0:
                 processed_any = True
@@ -1345,6 +1356,7 @@ def _run_tty_notes_first(
                 performance=performance,
                 started_at=time.perf_counter(),
                 status_renderer=status_renderer,
+                event_broadcaster=event_broadcaster,
             )
             return _apply_drain_summary(summary)
 
@@ -1550,6 +1562,7 @@ def _run_tty_notes_first(
                 config=config,
                 performance=performance,
                 started_at=time.perf_counter(),
+                event_broadcaster=event_broadcaster,
             )
         )
         if drain_started:
@@ -1923,6 +1936,7 @@ def start_command(
     started_at = time.time()
     warned_missing_engine_for_audio = False
     running_server: RunningTranscriptServer | None = None
+    event_broadcaster = TranscriptEventBroadcaster() if serve else None
     mic_capture = None
     system_capture = None
     performance = RuntimePerformance()
@@ -1947,6 +1961,7 @@ def start_command(
                     config.bind,
                     config.port,
                     serve_token=config.serve_token,
+                    event_broadcaster=event_broadcaster,
                 )
             except OSError as exc:
                 raise typer.BadParameter(
@@ -1982,6 +1997,7 @@ def start_command(
                         performance=performance,
                         started_at=started_at,
                         shutdown_signals=shutdown_signals,
+                        event_broadcaster=event_broadcaster,
                     )
                 if stopped_by_user:
                     typer.echo("\nStopped.")
@@ -2108,6 +2124,7 @@ def start_command(
                             gate_state=gate_state,
                             writer=writer,
                             started_at=cycle_started_at,
+                            event_broadcaster=event_broadcaster,
                         )
 
                         now_monotonic = time.monotonic()
@@ -2128,6 +2145,7 @@ def start_command(
                                 gate_state=gate_state,
                                 writer=writer,
                                 started_at=cycle_started_at,
+                                event_broadcaster=event_broadcaster,
                             )
                             if forced_windows:
                                 processed_any = True
@@ -2227,6 +2245,7 @@ def start_command(
                                 config=config,
                                 performance=performance,
                                 started_at=cycle_started_at,
+                                event_broadcaster=event_broadcaster,
                             )
                     except KeyboardInterrupt:
                         _handle_start_interrupt()
@@ -2244,6 +2263,7 @@ def start_command(
                                 gate_state=gate_state,
                                 writer=writer,
                                 started_at=time.perf_counter(),
+                                event_broadcaster=event_broadcaster,
                             )
                             break
                         except KeyboardInterrupt:
@@ -2260,6 +2280,7 @@ def start_command(
                                 config=config,
                                 performance=performance,
                                 started_at=time.perf_counter(),
+                                event_broadcaster=event_broadcaster,
                             )
                             break
                         except KeyboardInterrupt:

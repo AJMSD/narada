@@ -21,6 +21,7 @@ from narada.cli import app, start_command
 from narada.config import RuntimeConfig
 from narada.devices import AudioDevice
 from narada.live_notes import SessionSpool as LiveSessionSpool
+from narada.server import TranscriptEventBroadcaster
 from narada.setup.assistant import StartSetupResult
 
 
@@ -1581,12 +1582,17 @@ def test_start_with_serve_launches_and_stops_server(monkeypatch: Any, tmp_path: 
     monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls())
 
     def _start_server(
-        transcript_path: Path, bind: str, port: int, serve_token: str | None = None
+        transcript_path: Path,
+        bind: str,
+        port: int,
+        serve_token: str | None = None,
+        event_broadcaster: TranscriptEventBroadcaster | None = None,
     ) -> _FakeRunningServer:
         calls["transcript_path"] = transcript_path
         calls["bind"] = bind
         calls["port"] = port
         calls["serve_token"] = serve_token
+        calls["event_broadcaster"] = event_broadcaster
         return fake_server
 
     monkeypatch.setattr("narada.cli.start_transcript_server", _start_server)
@@ -1597,6 +1603,9 @@ def test_start_with_serve_launches_and_stops_server(monkeypatch: Any, tmp_path: 
     assert calls["bind"] == cfg.bind
     assert calls["port"] == cfg.port
     assert calls["serve_token"] is None
+    broadcaster = calls["event_broadcaster"]
+    assert broadcaster is not None
+    assert [event.data for event in broadcaster.events_after(0)] == ["served transcript"]
     assert fake_server.stopped
 
 
@@ -1630,12 +1639,17 @@ def test_start_with_serve_passes_serve_token(monkeypatch: Any, tmp_path: Path) -
     monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls())
 
     def _start_server(
-        transcript_path: Path, bind: str, port: int, serve_token: str | None = None
+        transcript_path: Path,
+        bind: str,
+        port: int,
+        serve_token: str | None = None,
+        event_broadcaster: TranscriptEventBroadcaster | None = None,
     ) -> _FakeRunningServer:
         calls["transcript_path"] = transcript_path
         calls["bind"] = bind
         calls["port"] = port
         calls["serve_token"] = serve_token
+        calls["event_broadcaster"] = event_broadcaster
         return fake_server
 
     monkeypatch.setattr("narada.cli.start_transcript_server", _start_server)
@@ -1645,6 +1659,7 @@ def test_start_with_serve_passes_serve_token(monkeypatch: Any, tmp_path: Path) -
     assert calls["bind"] == cfg.bind
     assert calls["port"] == cfg.port
     assert calls["serve_token"] == "topsecret"
+    assert calls["event_broadcaster"] is not None
     assert fake_server.stopped
 
 

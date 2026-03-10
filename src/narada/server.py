@@ -79,6 +79,7 @@ class TranscriptHTTPServer(ThreadingHTTPServer):
     transcript_path: Path
     stop_event: threading.Event
     serve_token: str | None
+    event_broadcaster: TranscriptEventBroadcaster | None
 
     def __init__(
         self,
@@ -87,11 +88,13 @@ class TranscriptHTTPServer(ThreadingHTTPServer):
         transcript_path: Path,
         stop_event: threading.Event,
         serve_token: str | None,
+        event_broadcaster: TranscriptEventBroadcaster | None = None,
     ) -> None:
         super().__init__(server_address, request_handler)
         self.transcript_path = transcript_path
         self.stop_event = stop_event
         self.serve_token = serve_token
+        self.event_broadcaster = event_broadcaster
 
     def handle_error(
         self,
@@ -182,6 +185,10 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
+        if self.server.event_broadcaster is not None:
+            self._serve_broadcast_events(self.server.event_broadcaster)
+            return
+
         cursor = self._parse_last_event_cursor(self.headers.get("Last-Event-ID"))
         while not self.server.stop_event.is_set():
             path = self.server.transcript_path
@@ -204,6 +211,23 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                     if sent_any:
                         self.wfile.flush()
                 time.sleep(0.5)
+            except (BrokenPipeError, ConnectionResetError):
+                break
+
+    def _serve_broadcast_events(self, broadcaster: TranscriptEventBroadcaster) -> None:
+        last_event_id = self._parse_last_event_cursor(self.headers.get("Last-Event-ID"))
+        while not self.server.stop_event.is_set():
+            try:
+                events = broadcaster.wait_for_events_after(last_event_id, timeout_s=0.5)
+                if not events:
+                    if broadcaster.closed:
+                        break
+                    continue
+                for event in events:
+                    payload = f"id: {event.event_id}\ndata: {event.data}\n\n"
+                    self.wfile.write(payload.encode("utf-8"))
+                    last_event_id = event.event_id
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 break
 
@@ -259,6 +283,83 @@ def render_ascii_qr(url: str) -> str:
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class TranscriptEvent:
+    event_id: int
+    data: str
+
+
+class TranscriptEventBroadcaster:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._events: list[TranscriptEvent] = []
+        self._next_event_id = 1
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        with self._condition:
+            return self._closed
+
+    def seed_from_file(self, transcript_path: Path) -> None:
+        if not transcript_path.exists():
+            return
+        lines = [line for line in transcript_path.read_text(encoding="utf-8").splitlines() if line]
+        if not lines:
+            return
+        with self._condition:
+            if self._events:
+                return
+            for line in lines:
+                self._append_event_unlocked(line)
+
+    def publish(self, data: str) -> int | None:
+        text = data.strip()
+        if not text:
+            return None
+        with self._condition:
+            if self._closed:
+                return None
+            event_id = self._append_event_unlocked(text)
+            self._condition.notify_all()
+            return event_id
+
+    def events_after(self, event_id: int) -> tuple[TranscriptEvent, ...]:
+        with self._condition:
+            return tuple(self._events[self._start_index(event_id) :])
+
+    def wait_for_events_after(
+        self,
+        event_id: int,
+        *,
+        timeout_s: float | None = None,
+    ) -> tuple[TranscriptEvent, ...]:
+        with self._condition:
+            events = self._events[self._start_index(event_id) :]
+            if events or self._closed:
+                return tuple(events)
+            self._condition.wait(timeout_s)
+            return tuple(self._events[self._start_index(event_id) :])
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+
+    def _append_event_unlocked(self, data: str) -> int:
+        event = TranscriptEvent(event_id=self._next_event_id, data=data)
+        self._events.append(event)
+        self._next_event_id += 1
+        return event.event_id
+
+    def _start_index(self, event_id: int) -> int:
+        if event_id <= 0:
+            return 0
+        return min(event_id, len(self._events))
+
+
 @dataclass
 class RunningTranscriptServer:
     server: TranscriptHTTPServer
@@ -268,6 +369,8 @@ class RunningTranscriptServer:
 
     def stop(self) -> None:
         self.stop_event.set()
+        if self.server.event_broadcaster is not None:
+            self.server.event_broadcaster.close()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2.0)
@@ -278,14 +381,18 @@ def start_transcript_server(
     bind: str,
     port: int,
     serve_token: str | None = None,
+    event_broadcaster: TranscriptEventBroadcaster | None = None,
 ) -> RunningTranscriptServer:
     stop_event = threading.Event()
+    if event_broadcaster is not None:
+        event_broadcaster.seed_from_file(transcript_path)
     server = TranscriptHTTPServer(
         (bind, port),
         TranscriptHandler,
         transcript_path,
         stop_event,
         serve_token,
+        event_broadcaster,
     )
     access_url = build_access_url(bind, int(server.server_address[1]), serve_token)
     thread = threading.Thread(

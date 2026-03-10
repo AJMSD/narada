@@ -8,11 +8,19 @@ from pathlib import Path
 
 import pytest
 
-from narada.server import TranscriptHandler, TranscriptHTTPServer, start_transcript_server
+from narada.server import (
+    TranscriptEventBroadcaster,
+    TranscriptHandler,
+    TranscriptHTTPServer,
+    start_transcript_server,
+)
 
 
 def _start_server(
-    transcript_path: Path, *, serve_token: str | None = None
+    transcript_path: Path,
+    *,
+    serve_token: str | None = None,
+    event_broadcaster: TranscriptEventBroadcaster | None = None,
 ) -> tuple[TranscriptHTTPServer, threading.Thread]:
     stop_event = threading.Event()
     server = TranscriptHTTPServer(
@@ -21,6 +29,7 @@ def _start_server(
         transcript_path,
         stop_event,
         serve_token,
+        event_broadcaster,
     )
     thread = threading.Thread(
         target=server.serve_forever,
@@ -144,6 +153,71 @@ def test_sse_invalid_last_event_id_falls_back_to_replay(tmp_path: Path) -> None:
         thread.join(timeout=2)
 
 
+def test_broadcaster_backed_sse_streams_without_file_polling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript_path = tmp_path / "session.txt"
+    broadcaster = TranscriptEventBroadcaster()
+    server, thread = _start_server(transcript_path, event_broadcaster=broadcaster)
+    port = server.server_address[1]
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("broadcaster-backed SSE should not poll the transcript file")
+        ),
+    )
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/events")
+        response = conn.getresponse()
+        assert response.status == 200
+        broadcaster.publish("first-line")
+        event_id, data = _read_sse_event(response)
+        assert int(event_id) == 1
+        assert data == "first-line"
+        conn.close()
+    finally:
+        server.stop_event.set()
+        broadcaster.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_broadcaster_reconnect_replays_only_missed_events(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.txt"
+    broadcaster = TranscriptEventBroadcaster()
+    server, thread = _start_server(transcript_path, event_broadcaster=broadcaster)
+    port = server.server_address[1]
+    try:
+        first_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        first_conn.request("GET", "/events")
+        first_response = first_conn.getresponse()
+        assert first_response.status == 200
+        broadcaster.publish("first-line")
+        first_id, first_data = _read_sse_event(first_response)
+        assert first_data == "first-line"
+        first_conn.close()
+
+        broadcaster.publish("second-line")
+
+        second_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        second_conn.request("GET", "/events", headers={"Last-Event-ID": first_id})
+        second_response = second_conn.getresponse()
+        assert second_response.status == 200
+        second_id, second_data = _read_sse_event(second_response)
+        assert second_data == "second-line"
+        assert int(second_id) > int(first_id)
+        second_conn.close()
+    finally:
+        server.stop_event.set()
+        broadcaster.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_start_transcript_server_helper_starts_and_stops(tmp_path: Path) -> None:
     transcript_path = tmp_path / "session.txt"
     transcript_path.write_text("line-one\n", encoding="utf-8")
@@ -157,6 +231,30 @@ def test_start_transcript_server_helper_starts_and_stops(tmp_path: Path) -> None
         with urllib.request.urlopen(f"{running.access_url}/transcript.txt", timeout=5) as response:
             body = response.read().decode("utf-8")
         assert "line-one" in body
+    finally:
+        running.stop()
+
+
+def test_start_transcript_server_seeds_broadcaster_from_existing_file(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.txt"
+    transcript_path.write_text("line-one\n", encoding="utf-8")
+    broadcaster = TranscriptEventBroadcaster()
+    running = start_transcript_server(
+        transcript_path=transcript_path,
+        bind="127.0.0.1",
+        port=0,
+        event_broadcaster=broadcaster,
+    )
+    try:
+        port = running.server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/events")
+        response = conn.getresponse()
+        assert response.status == 200
+        event_id, data = _read_sse_event(response)
+        assert int(event_id) == 1
+        assert data == "line-one"
+        conn.close()
     finally:
         running.stop()
 

@@ -31,7 +31,11 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
   durably fsynced on close.
 - Automatic hardware channel count detection for system capture; stereo WASAPI loopback devices are opened at their native channel count and downmixed to mono before ASR. If the detected count is rejected by the driver, Narada retries automatically through common fallback values (2, 1) before raising an error.
 - Optional LAN serving directly from `narada start --serve`.
+- In `narada start --serve`, browser live updates are pushed from in-memory
+  session events instead of polling the transcript file.
 - Optional LAN token auth via `--serve-token` for `/`, `/transcript.txt`, and `/events`.
+- Standalone `narada serve` remains file-backed for compatibility with
+  transcripts written by another process.
 - For faster-whisper on `--compute auto|cuda`, Narada automatically falls back to
   CPU for the current session if GPU runtime/transcription worker errors or timeouts occur.
 - Faster-whisper decode presets: `fast`, `balanced` (default), `accurate`.
