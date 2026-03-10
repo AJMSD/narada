@@ -37,6 +37,8 @@ Many meeting transcription tools require paid APIs or cloud upload of sensitive 
 - Faster-whisper decode presets: `fast`, `balanced` (default), `accurate`.
 - For whisper.cpp, Narada probes `whisper-cli` flag support at runtime and logs
   the resolved compute behavior (for example CPU no-GPU flags and backend hints).
+- For whisper.cpp on accelerated `--compute auto|cuda|metal`, long requests are
+  chunked internally and merged back into one final transcript result.
 - LAN live view endpoints:
   - `/` browser page
   - `/transcript.txt` raw transcript file
@@ -49,6 +51,9 @@ Narada supports two engine adapters from the start:
 
 `whisper-cpp` runtime requires a whisper.cpp CLI binary on `PATH`
 (`whisper-cli` or `whisper-cpp`).
+
+`faster-whisper` does not expose a real Metal execution path in this repo today;
+on macOS, `compute=metal` resolves away from a GPU backend.
 
 Select engine with:
 ```bash

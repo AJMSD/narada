@@ -20,10 +20,20 @@ def _build_fake_run(*, help_text: str, command_sink: list[list[str]]):
     return fake_run
 
 
-def _request(compute: str) -> TranscriptionRequest:
+def _pcm_for_duration_s(*, sample_rate_hz: int, duration_s: float) -> bytes:
+    sample_count = max(0, int(round(sample_rate_hz * duration_s)))
+    return b"\x00\x00" * sample_count
+
+
+def _request(
+    compute: str,
+    *,
+    pcm_bytes: bytes = b"\x00\x00\x10\x00",
+    sample_rate_hz: int = 16000,
+) -> TranscriptionRequest:
     return TranscriptionRequest(
-        pcm_bytes=b"\x00\x00\x10\x00",
-        sample_rate_hz=16000,
+        pcm_bytes=pcm_bytes,
+        sample_rate_hz=sample_rate_hz,
         languages=("en",),
         model="small",
         compute=compute,
@@ -314,6 +324,208 @@ def test_whisper_cpp_timeout_on_cuda_retries_with_cpu_args(
 
     assert result[0].text == "ok"
     assert len(transcribe_cmds) == 2
+    assert "--no-gpu" not in transcribe_cmds[0]
+    assert "--no-gpu" in transcribe_cmds[1]
+
+
+@pytest.mark.parametrize(
+    ("compute", "help_text"),
+    [
+        ("auto", "usage: whisper-cli --no-gpu"),
+        ("cuda", "usage: whisper-cli --no-gpu cuda"),
+        ("metal", "usage: whisper-cli --no-gpu metal"),
+    ],
+)
+def test_whisper_cpp_long_accelerated_requests_chunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compute: str,
+    help_text: str,
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(help_text=help_text, command_sink=captured_cmds)
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+
+    _ = engine.transcribe(
+        _request(
+            compute,
+            pcm_bytes=_pcm_for_duration_s(sample_rate_hz=2, duration_s=121.0),
+            sample_rate_hz=2,
+        )
+    )
+
+    transcribe_cmds = [cmd for cmd in captured_cmds if cmd[1] not in {"-h", "--help"}]
+    assert len(transcribe_cmds) == 3
+
+
+def test_whisper_cpp_short_accelerated_request_does_not_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(
+        help_text="usage: whisper-cli --no-gpu cuda metal",
+        command_sink=captured_cmds,
+    )
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+
+    _ = engine.transcribe(
+        _request(
+            "cuda",
+            pcm_bytes=_pcm_for_duration_s(sample_rate_hz=2, duration_s=60.0),
+            sample_rate_hz=2,
+        )
+    )
+
+    transcribe_cmds = [cmd for cmd in captured_cmds if cmd[1] not in {"-h", "--help"}]
+    assert len(transcribe_cmds) == 1
+
+
+def test_whisper_cpp_long_cpu_request_does_not_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(
+        help_text="usage: whisper-cli --no-gpu cuda metal",
+        command_sink=captured_cmds,
+    )
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+
+    _ = engine.transcribe(
+        _request(
+            "cpu",
+            pcm_bytes=_pcm_for_duration_s(sample_rate_hz=2, duration_s=121.0),
+            sample_rate_hz=2,
+        )
+    )
+
+    transcribe_cmds = [cmd for cmd in captured_cmds if cmd[1] not in {"-h", "--help"}]
+    assert len(transcribe_cmds) == 1
+
+
+def test_whisper_cpp_chunked_merge_returns_single_segment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    chunk_texts = iter(
+        [
+            "alpha beta keep this phrase going",
+            "keep this phrase going delta epsilon final words",
+            "delta epsilon final words omega",
+        ]
+    )
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if cmd[1] in {"-h", "--help"}:
+            return subprocess.CompletedProcess(cmd, 0, "usage: whisper-cli --no-gpu metal", "")
+        base = Path(cmd[cmd.index("-of") + 1])
+        base.with_suffix(".txt").write_text(next(chunk_texts), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+    result = engine.transcribe(
+        _request(
+            "metal",
+            pcm_bytes=_pcm_for_duration_s(sample_rate_hz=2, duration_s=121.0),
+            sample_rate_hz=2,
+        )
+    )
+
+    assert len(result) == 1
+    assert result[0].text == "alpha beta keep this phrase going delta epsilon final words omega"
+    assert result[0].end_s == pytest.approx(121.0)
+
+
+def test_whisper_cpp_chunked_merge_keeps_short_overlap_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    chunk_texts = iter(
+        [
+            "alpha beta keep this phrase",
+            "keep this phrase delta epsilon",
+            "delta epsilon zeta",
+        ]
+    )
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if cmd[1] in {"-h", "--help"}:
+            return subprocess.CompletedProcess(cmd, 0, "usage: whisper-cli --no-gpu auto", "")
+        base = Path(cmd[cmd.index("-of") + 1])
+        base.with_suffix(".txt").write_text(next(chunk_texts), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+    result = engine.transcribe(
+        _request(
+            "auto",
+            pcm_bytes=_pcm_for_duration_s(sample_rate_hz=2, duration_s=121.0),
+            sample_rate_hz=2,
+        )
+    )
+
+    assert "keep this phrase keep this phrase" in result[0].text
+
+
+def test_whisper_cpp_long_chunk_timeout_retry_uses_cpu_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    transcribe_cmds: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if cmd[1] in {"-h", "--help"}:
+            return subprocess.CompletedProcess(cmd, 0, "usage: whisper-cli --no-gpu cuda", "")
+        transcribe_cmds.append(cmd)
+        if len(transcribe_cmds) == 1:
+            timeout = float(kwargs.get("timeout", 0.0))
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+        base = Path(cmd[cmd.index("-of") + 1])
+        base.with_suffix(".txt").write_text(f"chunk-{len(transcribe_cmds)}", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+    _ = engine.transcribe(
+        _request(
+            "cuda",
+            pcm_bytes=_pcm_for_duration_s(sample_rate_hz=2, duration_s=121.0),
+            sample_rate_hz=2,
+        )
+    )
+
+    assert len(transcribe_cmds) == 4
     assert "--no-gpu" not in transcribe_cmds[0]
     assert "--no-gpu" in transcribe_cmds[1]
 

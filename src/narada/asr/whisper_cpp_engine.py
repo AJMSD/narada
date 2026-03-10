@@ -66,6 +66,10 @@ class WhisperCppEngine:
     _TRANSCRIBE_TIMEOUT_BASE_CPU_S: ClassVar[float] = 30.0
     _TRANSCRIBE_TIMEOUT_MAX_GPU_S: ClassVar[float] = 600.0
     _TRANSCRIBE_TIMEOUT_MAX_CPU_S: ClassVar[float] = 1800.0
+    _ACCELERATED_CHUNK_THRESHOLD_S: ClassVar[float] = 120.0
+    _ACCELERATED_CHUNK_DURATION_S: ClassVar[float] = 60.0
+    _ACCELERATED_CHUNK_OVERLAP_S: ClassVar[float] = 1.5
+    _CHUNK_MERGE_MIN_OVERLAP_TOKENS: ClassVar[int] = 4
 
     def __init__(
         self,
@@ -96,71 +100,38 @@ class WhisperCppEngine:
         compute_resolution = self.resolve_requested_compute(request.compute)
         runtime = self._resolve_runtime(request.model, compute_resolution.effective_compute)
         self._warmup(runtime)
+        retry_runtime = self._resolve_retry_runtime(runtime=runtime, model_name=request.model)
+        duration_s = self._pcm_duration_s(
+            pcm_bytes=request.pcm_bytes,
+            sample_rate_hz=request.sample_rate_hz,
+        )
 
         with tempfile.TemporaryDirectory(prefix="narada-whispercpp-") as tmp_dir:
             temp_root = Path(tmp_dir)
-            input_wav = temp_root / "input.wav"
-            output_base = temp_root / "result"
-            self._write_pcm_to_wav(
-                output_path=input_wav,
-                pcm_bytes=request.pcm_bytes,
-                sample_rate_hz=request.sample_rate_hz,
-            )
-            cmd = [
-                runtime.cli_path,
-                "-m",
-                str(runtime.model_path),
-                "-f",
-                str(input_wav),
-                "-of",
-                str(output_base),
-                "-otxt",
-                "-np",
-            ]
-            language = self._choose_language(request.languages)
-            duration_s = len(request.pcm_bytes) / 2.0 / request.sample_rate_hz
-            retry_runtime = runtime
-            if runtime.requested_compute in {"auto", "cuda", "metal"}:
-                cpu_runtime = self._resolve_runtime(request.model, "cpu")
-                if cpu_runtime.compute_args != runtime.compute_args:
-                    retry_runtime = cpu_runtime
-            result: subprocess.CompletedProcess[str] | None = None
-            for attempt_idx in range(2):
-                selected_runtime = runtime if attempt_idx == 0 else retry_runtime
-                self._warmup(selected_runtime)
-                attempt_cmd = list(cmd)
-                attempt_cmd.extend(selected_runtime.compute_args)
-                if language is not None:
-                    attempt_cmd.extend(["-l", language])
-                timeout_s = self._compute_transcribe_timeout_s(
-                    audio_seconds=duration_s,
-                    compute=selected_runtime.requested_compute,
+            if self._should_chunk_accelerated_request(
+                audio_seconds=duration_s,
+                compute=runtime.requested_compute,
+            ):
+                text = self._transcribe_chunked_request(
+                    pcm_bytes=request.pcm_bytes,
+                    sample_rate_hz=request.sample_rate_hz,
+                    languages=request.languages,
                     asr_preset=request.asr_preset,
+                    runtime=runtime,
+                    retry_runtime=retry_runtime,
+                    temp_root=temp_root,
                 )
-                try:
-                    result = self._run_command(attempt_cmd, timeout=timeout_s)
-                    if result.returncode != 0:
-                        raise EngineUnavailableError(self._format_process_failure(result))
-                    break
-                except subprocess.TimeoutExpired as exc:
-                    if attempt_idx == 0:
-                        logger.debug(
-                            "whisper.cpp timed out after %.1fs on %s; retrying once on %s.",
-                            timeout_s,
-                            runtime.requested_compute,
-                            retry_runtime.requested_compute,
-                        )
-                        continue
-                    raise EngineUnavailableError(
-                        "whisper.cpp transcription timed out after retry."
-                    ) from exc
-            if result is None:
-                raise EngineUnavailableError("whisper.cpp transcription did not produce a result.")
-
-            text_output = output_base.with_suffix(".txt")
-            if not text_output.exists():
-                return []
-            text = text_output.read_text(encoding="utf-8").strip()
+            else:
+                text = self._transcribe_request_text(
+                    pcm_bytes=request.pcm_bytes,
+                    sample_rate_hz=request.sample_rate_hz,
+                    languages=request.languages,
+                    asr_preset=request.asr_preset,
+                    runtime=runtime,
+                    retry_runtime=retry_runtime,
+                    temp_root=temp_root,
+                    stem="result",
+                )
             if not text:
                 return []
 
@@ -173,6 +144,245 @@ class WhisperCppEngine:
                     is_final=True,
                 )
             ]
+
+    @classmethod
+    def _pcm_duration_s(
+        cls,
+        *,
+        pcm_bytes: bytes,
+        sample_rate_hz: int,
+    ) -> float:
+        if sample_rate_hz <= 0:
+            raise ValueError("sample_rate_hz must be positive.")
+        return len(pcm_bytes) / 2.0 / sample_rate_hz
+
+    def _resolve_retry_runtime(
+        self,
+        *,
+        runtime: WhisperCppRuntime,
+        model_name: str,
+    ) -> WhisperCppRuntime:
+        retry_runtime = runtime
+        if runtime.requested_compute in {"auto", "cuda", "metal"}:
+            cpu_runtime = self._resolve_runtime(model_name, "cpu")
+            if cpu_runtime.compute_args != runtime.compute_args:
+                retry_runtime = cpu_runtime
+        return retry_runtime
+
+    @classmethod
+    def _should_chunk_accelerated_request(
+        cls,
+        *,
+        audio_seconds: float,
+        compute: str,
+    ) -> bool:
+        normalized_compute = compute.strip().lower()
+        return (
+            normalized_compute in {"auto", "cuda", "metal"}
+            and audio_seconds > cls._ACCELERATED_CHUNK_THRESHOLD_S
+        )
+
+    def _transcribe_chunked_request(
+        self,
+        *,
+        pcm_bytes: bytes,
+        sample_rate_hz: int,
+        languages: tuple[str, ...],
+        asr_preset: str,
+        runtime: WhisperCppRuntime,
+        retry_runtime: WhisperCppRuntime,
+        temp_root: Path,
+    ) -> str:
+        chunk_texts: list[str] = []
+        for chunk_index, (chunk_pcm_bytes, _chunk_offset_s) in enumerate(
+            self._iter_accelerated_chunks(
+                pcm_bytes=pcm_bytes,
+                sample_rate_hz=sample_rate_hz,
+            )
+        ):
+            chunk_text = self._transcribe_request_text(
+                pcm_bytes=chunk_pcm_bytes,
+                sample_rate_hz=sample_rate_hz,
+                languages=languages,
+                asr_preset=asr_preset,
+                runtime=runtime,
+                retry_runtime=retry_runtime,
+                temp_root=temp_root,
+                stem=f"chunk-{chunk_index:03d}",
+            )
+            if chunk_text:
+                chunk_texts.append(chunk_text)
+        return self._merge_chunk_texts(chunk_texts)
+
+    def _transcribe_request_text(
+        self,
+        *,
+        pcm_bytes: bytes,
+        sample_rate_hz: int,
+        languages: tuple[str, ...],
+        asr_preset: str,
+        runtime: WhisperCppRuntime,
+        retry_runtime: WhisperCppRuntime,
+        temp_root: Path,
+        stem: str,
+    ) -> str:
+        input_wav = temp_root / f"{stem}.wav"
+        output_base = temp_root / stem
+        self._write_pcm_to_wav(
+            output_path=input_wav,
+            pcm_bytes=pcm_bytes,
+            sample_rate_hz=sample_rate_hz,
+        )
+        cmd = [
+            runtime.cli_path,
+            "-m",
+            str(runtime.model_path),
+            "-f",
+            str(input_wav),
+            "-of",
+            str(output_base),
+            "-otxt",
+            "-np",
+        ]
+        language = self._choose_language(languages)
+        duration_s = self._pcm_duration_s(
+            pcm_bytes=pcm_bytes,
+            sample_rate_hz=sample_rate_hz,
+        )
+        self._run_transcribe_attempts(
+            cmd=cmd,
+            runtime=runtime,
+            retry_runtime=retry_runtime,
+            audio_seconds=duration_s,
+            language=language,
+            asr_preset=asr_preset,
+        )
+        text_output = output_base.with_suffix(".txt")
+        if not text_output.exists():
+            return ""
+        return text_output.read_text(encoding="utf-8").strip()
+
+    def _run_transcribe_attempts(
+        self,
+        *,
+        cmd: Sequence[str],
+        runtime: WhisperCppRuntime,
+        retry_runtime: WhisperCppRuntime,
+        audio_seconds: float,
+        language: str | None,
+        asr_preset: str,
+    ) -> None:
+        result: subprocess.CompletedProcess[str] | None = None
+        for attempt_idx in range(2):
+            selected_runtime = runtime if attempt_idx == 0 else retry_runtime
+            self._warmup(selected_runtime)
+            attempt_cmd = list(cmd)
+            attempt_cmd.extend(selected_runtime.compute_args)
+            if language is not None:
+                attempt_cmd.extend(["-l", language])
+            timeout_s = self._compute_transcribe_timeout_s(
+                audio_seconds=audio_seconds,
+                compute=selected_runtime.requested_compute,
+                asr_preset=asr_preset,
+            )
+            try:
+                result = self._run_command(attempt_cmd, timeout=timeout_s)
+                if result.returncode != 0:
+                    raise EngineUnavailableError(self._format_process_failure(result))
+                return
+            except subprocess.TimeoutExpired as exc:
+                if attempt_idx == 0:
+                    logger.debug(
+                        "whisper.cpp timed out after %.1fs on %s; retrying once on %s.",
+                        timeout_s,
+                        runtime.requested_compute,
+                        retry_runtime.requested_compute,
+                    )
+                    continue
+                raise EngineUnavailableError(
+                    "whisper.cpp transcription timed out after retry."
+                ) from exc
+        if result is None:
+            raise EngineUnavailableError("whisper.cpp transcription did not produce a result.")
+
+    @classmethod
+    def _iter_accelerated_chunks(
+        cls,
+        *,
+        pcm_bytes: bytes,
+        sample_rate_hz: int,
+    ) -> list[tuple[bytes, float]]:
+        sample_count = len(pcm_bytes) // 2
+        if sample_count <= 0:
+            return []
+        chunk_samples = max(1, int(round(cls._ACCELERATED_CHUNK_DURATION_S * sample_rate_hz)))
+        overlap_samples = max(0, int(round(cls._ACCELERATED_CHUNK_OVERLAP_S * sample_rate_hz)))
+        stride_samples = max(1, chunk_samples - overlap_samples)
+
+        chunks: list[tuple[bytes, float]] = []
+        start_sample = 0
+        while start_sample < sample_count:
+            end_sample = min(sample_count, start_sample + chunk_samples)
+            start_byte = start_sample * 2
+            end_byte = end_sample * 2
+            chunks.append((pcm_bytes[start_byte:end_byte], start_sample / sample_rate_hz))
+            if end_sample >= sample_count:
+                break
+            start_sample += stride_samples
+        return chunks
+
+    @classmethod
+    def _merge_chunk_texts(cls, texts: Sequence[str]) -> str:
+        merged = ""
+        for text in texts:
+            chunk_text = text.strip()
+            if not chunk_text:
+                continue
+            if not merged:
+                merged = chunk_text
+                continue
+            merged = cls._merge_adjacent_chunk_texts(merged, chunk_text)
+        return merged
+
+    @classmethod
+    def _merge_adjacent_chunk_texts(cls, left: str, right: str) -> str:
+        trimmed_right = cls._trim_chunk_overlap_prefix(left, right)
+        if trimmed_right is None:
+            return cls._join_chunk_texts(left, right)
+        return cls._join_chunk_texts(left, trimmed_right)
+
+    @classmethod
+    def _trim_chunk_overlap_prefix(cls, left: str, right: str) -> str | None:
+        left_tokens, _ = cls._tokenize_chunk_text(left)
+        right_tokens, right_spans = cls._tokenize_chunk_text(right)
+        max_overlap = min(len(left_tokens), len(right_tokens))
+        for overlap_size in range(max_overlap, cls._CHUNK_MERGE_MIN_OVERLAP_TOKENS - 1, -1):
+            if left_tokens[-overlap_size:] != right_tokens[:overlap_size]:
+                continue
+            if overlap_size >= len(right_spans):
+                return ""
+            trim_start = right_spans[overlap_size][0]
+            return right[trim_start:].lstrip()
+        return None
+
+    @staticmethod
+    def _join_chunk_texts(left: str, right: str) -> str:
+        if not left:
+            return right
+        if not right:
+            return left
+        if left.endswith((" ", "\n", "\t")):
+            return f"{left}{right.lstrip()}"
+        return f"{left} {right}"
+
+    @staticmethod
+    def _tokenize_chunk_text(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+        tokens: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for match in re.finditer(r"[A-Za-z0-9']+", text):
+            tokens.append(match.group(0).lower())
+            spans.append(match.span())
+        return tokens, spans
 
     @classmethod
     def _compute_transcribe_timeout_s(
