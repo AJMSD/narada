@@ -148,6 +148,73 @@ def test_whisper_cpp_cuda_compute_does_not_disable_gpu(
     assert "-ngl" not in transcribe_cmd
 
 
+def test_whisper_cpp_resolve_requested_compute_downgrades_unsupported_cuda_to_auto() -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(
+        help_text="usage: whisper-cli ... --no-gpu ...",
+        command_sink=captured_cmds,
+    )
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+
+    resolution = engine.resolve_requested_compute("cuda")
+
+    assert resolution.requested_compute == "cuda"
+    assert resolution.effective_compute == "auto"
+    assert resolution.warning is not None
+    assert "compute=cuda" in resolution.warning
+    assert "compute=auto" in resolution.warning
+
+
+def test_whisper_cpp_resolve_requested_compute_downgrades_unsupported_metal_to_auto() -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(
+        help_text="usage: whisper-cli ... --no-gpu ... cuda",
+        command_sink=captured_cmds,
+    )
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+
+    resolution = engine.resolve_requested_compute("metal")
+
+    assert resolution.requested_compute == "metal"
+    assert resolution.effective_compute == "auto"
+    assert resolution.warning is not None
+    assert "compute=metal" in resolution.warning
+
+
+def test_whisper_cpp_resolve_requested_compute_keeps_supported_backend() -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(
+        help_text="usage: whisper-cli ... --no-gpu ... cuda metal",
+        command_sink=captured_cmds,
+    )
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+
+    resolution = engine.resolve_requested_compute("cuda")
+
+    assert resolution.requested_compute == "cuda"
+    assert resolution.effective_compute == "cuda"
+    assert resolution.warning is None
+
+
+def test_whisper_cpp_resolve_requested_compute_keeps_auto_when_hints_unknown() -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    captured_cmds: list[list[str]] = []
+    fake_run = _build_fake_run(
+        help_text="usage: whisper-cli ... --no-gpu ...",
+        command_sink=captured_cmds,
+    )
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+
+    resolution = engine.resolve_requested_compute("auto")
+
+    assert resolution.requested_compute == "auto"
+    assert resolution.effective_compute == "auto"
+    assert resolution.warning is None
+
+
 def test_whisper_cpp_probe_capabilities_detects_flags_and_backend_hints() -> None:
     WhisperCppEngine.clear_cache_for_tests()
     captured_cmds: list[list[str]] = []

@@ -11,7 +11,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
@@ -36,7 +36,7 @@ from narada.audio.capture import (
     open_mic_capture,
     open_system_capture,
 )
-from narada.config import ConfigError, ConfigOverrides, RuntimeConfig, build_runtime_config
+from narada.config import Compute, ConfigError, ConfigOverrides, RuntimeConfig, build_runtime_config
 from narada.devices import (
     DEVICE_TYPES,
     AmbiguousDeviceError,
@@ -332,6 +332,30 @@ def _safe_echo(message: str, *, err: bool = False, nl: bool = True) -> None:
             fallback_stream.flush()
         except Exception:
             return
+
+
+def _maybe_apply_whisper_cpp_compute_resolution(
+    *,
+    selected_engine: str,
+    engine_instance: AsrEngine,
+    config: RuntimeConfig,
+) -> RuntimeConfig:
+    if selected_engine != "whisper-cpp" or not engine_instance.is_available():
+        return config
+
+    resolve_compute = getattr(engine_instance, "resolve_requested_compute", None)
+    if not callable(resolve_compute):
+        return config
+
+    resolution = resolve_compute(config.compute)
+    warning = cast(str | None, getattr(resolution, "warning", None))
+    if warning:
+        _safe_echo(f"Warning: {warning}", err=True)
+
+    effective_compute = cast(str, getattr(resolution, "effective_compute", config.compute))
+    if effective_compute == config.compute:
+        return config
+    return replace(config, compute=cast(Compute, effective_compute))
 
 
 def _resolve_terminal_columns(*, default_columns: int = 120) -> int:
@@ -1879,6 +1903,11 @@ def start_command(
                 except ModelPreparationError as fallback_exc:
                     raise typer.BadParameter(str(fallback_exc)) from fallback_exc
 
+    config = _maybe_apply_whisper_cpp_compute_resolution(
+        selected_engine=selected_engine,
+        engine_instance=engine_instance,
+        config=config,
+    )
     gate_state = ConfidenceGate(config.confidence_threshold)
     engine_available = engine_instance.is_available()
 

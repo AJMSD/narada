@@ -158,6 +158,27 @@ class _RecordingSampleRateEngine(_FakeEngine):
         return super().transcribe(request)
 
 
+class _FakeWhisperCppEngine(_FakeEngine):
+    def __init__(self, text: str, *, effective_compute: str, warning: str | None) -> None:
+        super().__init__(text=text)
+        self.effective_compute = effective_compute
+        self.warning = warning
+        self.requested_computes: list[str] = []
+        self.transcribed_computes: list[str] = []
+
+    def resolve_requested_compute(self, compute: str) -> SimpleNamespace:
+        self.requested_computes.append(compute)
+        return SimpleNamespace(
+            requested_compute=compute,
+            effective_compute=self.effective_compute,
+            warning=self.warning,
+        )
+
+    def transcribe(self, request: TranscriptionRequest) -> list[TranscriptSegment]:
+        self.transcribed_computes.append(request.compute)
+        return super().transcribe(request)
+
+
 class _SlowEngine(_FakeEngine):
     def __init__(self, text: str, delay_s: float) -> None:
         super().__init__(text=text)
@@ -389,6 +410,57 @@ def test_start_integration_system_mode(monkeypatch: Any, tmp_path: Path) -> None
     assert "system transcript" in out_path.read_text(encoding="utf-8")
     assert system_capture.closed
     assert fake_engine.calls >= 1
+
+
+def test_start_warns_and_uses_auto_for_unsupported_whisper_cpp_compute(
+    monkeypatch: Any,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out_path = tmp_path / "whisper-cpp-compute.txt"
+    cfg = _runtime_config("mic", out_path)
+    cfg = RuntimeConfig(
+        **{
+            **cfg.__dict__,
+            "engine": "whisper-cpp",
+            "compute": "cuda",
+        }
+    )
+    fake_engine = _FakeWhisperCppEngine(
+        "whisper cpp transcript",
+        effective_compute="auto",
+        warning="whisper-cli does not advertise support for compute=cuda; using compute=auto.",
+    )
+    mic_capture = _FakeCapture(frames=[_frame()])
+
+    monkeypatch.setattr("narada.cli.build_runtime_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        "narada.cli._resolve_selected_devices",
+        lambda *_args, **_kwargs: (AudioDevice(1, "Mic", "input"), None, []),
+    )
+    monkeypatch.setattr("narada.cli.discover_models", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        "narada.cli.build_start_model_preflight",
+        lambda *_args, **_kwargs: StartModelPreflight(
+            selected_engine="whisper-cpp",
+            selected_available=True,
+            recommended_engine=None,
+            messages=(),
+        ),
+    )
+    monkeypatch.setattr("narada.cli.build_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr("narada.cli.open_mic_capture", lambda *_args, **_kwargs: mic_capture)
+    monkeypatch.setattr("narada.cli.sys.stdin", _TTYStdin())
+    monkeypatch.setattr("narada.cli.time.sleep", _interrupt_after_sleep_calls())
+
+    _run_start_for_tests()
+
+    captured = capsys.readouterr()
+    assert "compute=cuda" in captured.err
+    assert fake_engine.requested_computes == ["cuda"]
+    assert fake_engine.transcribed_computes
+    assert all(value == "auto" for value in fake_engine.transcribed_computes)
+    assert "whisper cpp transcript" in out_path.read_text(encoding="utf-8")
 
 
 def test_start_cli_rejects_mixed_mode() -> None:

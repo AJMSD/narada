@@ -47,6 +47,13 @@ class WhisperCppRuntime:
     capabilities: WhisperCliCapabilities
 
 
+@dataclass(frozen=True)
+class WhisperCppComputeResolution:
+    requested_compute: str
+    effective_compute: str
+    warning: str | None = None
+
+
 class WhisperCppEngine:
     name = "whisper-cpp"
     _runtime_cache: ClassVar[dict[tuple[str, str], WhisperCppRuntime]] = {}
@@ -85,7 +92,8 @@ class WhisperCppEngine:
         if not request.pcm_bytes:
             return []
 
-        runtime = self._resolve_runtime(request.model, request.compute)
+        compute_resolution = self.resolve_requested_compute(request.compute)
+        runtime = self._resolve_runtime(request.model, compute_resolution.effective_compute)
         self._warmup(runtime)
 
         with tempfile.TemporaryDirectory(prefix="narada-whispercpp-") as tmp_dir:
@@ -244,6 +252,32 @@ class WhisperCppEngine:
         if normalized in {"auto", "cpu", "cuda", "metal"}:
             return normalized
         raise EngineUnavailableError(f"Unsupported compute backend '{compute}' for whisper.cpp.")
+
+    def resolve_requested_compute(self, compute: str) -> WhisperCppComputeResolution:
+        normalized_compute = self._normalize_compute(compute)
+        if normalized_compute in {"auto", "cpu"}:
+            return WhisperCppComputeResolution(
+                requested_compute=normalized_compute,
+                effective_compute=normalized_compute,
+            )
+
+        capabilities = self.probe_cli_capabilities()
+        if normalized_compute in capabilities.backend_hints:
+            return WhisperCppComputeResolution(
+                requested_compute=normalized_compute,
+                effective_compute=normalized_compute,
+            )
+
+        hints_text = ", ".join(capabilities.backend_hints)
+        hint_suffix = f" Advertised backends: {hints_text}." if hints_text else ""
+        return WhisperCppComputeResolution(
+            requested_compute=normalized_compute,
+            effective_compute="auto",
+            warning=(
+                f"whisper-cli does not advertise support for compute={normalized_compute}; "
+                f"using compute=auto for this session.{hint_suffix}"
+            ),
+        )
 
     @staticmethod
     def _detect_backend_hint(help_text: str) -> tuple[str, ...]:

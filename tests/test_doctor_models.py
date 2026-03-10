@@ -1,6 +1,9 @@
 from pathlib import Path
 
+import pytest
+
 from narada import doctor
+from narada.asr.whisper_cpp_engine import WhisperCliCapabilities
 from narada.doctor import DoctorCheck
 
 
@@ -28,3 +31,26 @@ def test_has_failures_ignores_info_status() -> None:
         DoctorCheck(name="y", status="INFO", message="optional"),
     ]
     assert not doctor.has_failures(checks)
+
+
+def test_whisper_cli_compatibility_mentions_auto_downgrade_when_backend_hints_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeWhisperEngine:
+        def is_available(self) -> bool:
+            return True
+
+        def probe_cli_capabilities(self) -> WhisperCliCapabilities:
+            return WhisperCliCapabilities(
+                no_gpu_flag="--no-gpu",
+                gpu_layers_flag=None,
+                backend_hints=(),
+            )
+
+    monkeypatch.setattr(doctor, "WhisperCppEngine", lambda: _FakeWhisperEngine())
+
+    check = doctor._whisper_cli_compatibility_check()  # noqa: SLF001
+
+    assert check.status == "PASS"
+    assert "compute=auto" in check.message
+    assert "compute=cuda|metal" in check.message

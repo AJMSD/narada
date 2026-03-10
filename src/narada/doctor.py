@@ -84,6 +84,11 @@ def _whisper_cli_compatibility_check() -> DoctorCheck:
     )
     if status == "WARN":
         message += " | compute=cpu cannot be strictly enforced on this whisper-cli build."
+    if not capabilities.backend_hints:
+        message += (
+            " | Explicit whisper.cpp compute=cuda|metal requests cannot be validated on "
+            "this build and may be downgraded to compute=auto."
+        )
     return DoctorCheck(name="whisper-cli compatibility", status=status, message=message)
 
 
