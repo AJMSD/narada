@@ -60,6 +60,7 @@ class WhisperCppEngine:
     _warmed: ClassVar[set[tuple[str, str]]] = set()
     _capability_cache: ClassVar[dict[str, WhisperCliCapabilities]] = {}
     _cache_lock: ClassVar[Lock] = Lock()
+    _spawn_lock: ClassVar[Lock] = Lock()
     _TRANSCRIBE_TIMEOUT_MIN_S: ClassVar[float] = 20.0
     _TRANSCRIBE_TIMEOUT_BASE_GPU_S: ClassVar[float] = 15.0
     _TRANSCRIBE_TIMEOUT_BASE_CPU_S: ClassVar[float] = 30.0
@@ -137,18 +138,9 @@ class WhisperCppEngine:
                     asr_preset=request.asr_preset,
                 )
                 try:
-                    result = self._run_fn(
-                        attempt_cmd,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=timeout_s,
-                    )
+                    result = self._run_command(attempt_cmd, timeout=timeout_s)
                     if result.returncode != 0:
-                        raise EngineUnavailableError(
-                            "whisper.cpp transcription failed: "
-                            f"{(result.stderr or result.stdout).strip()}"
-                        )
+                        raise EngineUnavailableError(self._format_process_failure(result))
                     break
                 except subprocess.TimeoutExpired as exc:
                     if attempt_idx == 0:
@@ -300,12 +292,7 @@ class WhisperCppEngine:
 
         help_text = ""
         for help_arg in ("-h", "--help"):
-            result = self._run_fn(
-                [cli_path, help_arg],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            result = self._run_command([cli_path, help_arg])
             help_text = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
             if help_text:
                 break
@@ -389,6 +376,102 @@ class WhisperCppEngine:
         with self._cache_lock:
             self._runtime_cache[cache_key] = runtime
         return runtime
+
+    def _run_command(
+        self,
+        cmd: Sequence[str],
+        *,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if self._run_fn is not subprocess.run:
+            return self._run_fn(
+                list(cmd),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        return self._run_subprocess(cmd, timeout=timeout)
+
+    @classmethod
+    def _run_subprocess(
+        cls,
+        cmd: Sequence[str],
+        *,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        argv = list(cmd)
+        if not cls._is_windows():
+            return subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+
+        with cls._spawn_lock:
+            ignore_enabled = cls._set_windows_console_ctrl_handling(ignore=True)
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            finally:
+                if ignore_enabled:
+                    cls._set_windows_console_ctrl_handling(ignore=False)
+
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                cmd=exc.cmd,
+                timeout=exc.timeout,
+                output=stdout,
+                stderr=stderr,
+            ) from exc
+
+        return subprocess.CompletedProcess(
+            argv,
+            int(process.returncode or 0),
+            stdout or "",
+            stderr or "",
+        )
+
+    @staticmethod
+    def _is_windows() -> bool:
+        return os.name == "nt"
+
+    @staticmethod
+    def _set_windows_console_ctrl_handling(*, ignore: bool) -> bool:
+        if not WhisperCppEngine._is_windows():
+            return False
+        try:
+            import ctypes
+
+            windll = getattr(ctypes, "windll", None)
+            if windll is None:
+                return False
+            kernel32 = getattr(windll, "kernel32", None)
+            if kernel32 is None:
+                return False
+            set_console_ctrl_handler = getattr(kernel32, "SetConsoleCtrlHandler", None)
+            if set_console_ctrl_handler is None:
+                return False
+            return int(set_console_ctrl_handler(None, bool(ignore))) != 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _format_process_failure(result: subprocess.CompletedProcess[str]) -> str:
+        details = (result.stderr or result.stdout).strip()
+        if details:
+            return f"whisper.cpp transcription failed (exit {result.returncode}): {details}"
+        return f"whisper.cpp transcription failed (exit {result.returncode})."
 
     @classmethod
     def _warmup(cls, runtime: WhisperCppRuntime) -> None:

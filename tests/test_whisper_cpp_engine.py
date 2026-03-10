@@ -318,6 +318,101 @@ def test_whisper_cpp_timeout_on_cuda_retries_with_cpu_args(
     assert "--no-gpu" in transcribe_cmds[1]
 
 
+def test_whisper_cpp_nonzero_exit_includes_returncode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperCppEngine.clear_cache_for_tests()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / "ggml-small.bin").write_bytes(b"model")
+    monkeypatch.setenv("NARADA_WHISPER_CPP_MODEL_DIR", str(model_dir))
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if cmd[1] in {"-h", "--help"}:
+            return subprocess.CompletedProcess(cmd, 0, "usage: whisper-cli --no-gpu", "")
+        return subprocess.CompletedProcess(cmd, 7, "", "")
+
+    engine = WhisperCppEngine(which_fn=lambda _: "whisper-cli", run_fn=fake_run)
+    with pytest.raises(EngineUnavailableError, match=r"exit 7"):
+        engine.transcribe(_request("cpu"))
+
+
+def test_whisper_cpp_windows_spawn_hardening_wraps_process_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class _FakeProcess:
+        def __init__(self, cmd: list[str], **kwargs: object) -> None:
+            calls.append(("popen", list(cmd), kwargs))
+            self.returncode = 0
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            calls.append(("communicate", timeout))
+            return ("stdout", "stderr")
+
+        def kill(self) -> None:
+            calls.append(("kill", None))
+
+    def _record_ctrl(*, ignore: bool) -> bool:
+        calls.append(("ctrl", ignore))
+        return True
+
+    monkeypatch.setattr(WhisperCppEngine, "_is_windows", staticmethod(lambda: True))
+    monkeypatch.setattr(
+        WhisperCppEngine,
+        "_set_windows_console_ctrl_handling",
+        staticmethod(_record_ctrl),
+    )
+    monkeypatch.setattr(subprocess, "Popen", _FakeProcess)
+
+    result = WhisperCppEngine._run_subprocess(["whisper-cli", "-h"], timeout=3.5)
+
+    assert result.stdout == "stdout"
+    assert result.stderr == "stderr"
+    assert calls[0] == ("ctrl", True)
+    assert calls[1][0] == "popen"
+    assert calls[2] == ("ctrl", False)
+    assert calls[3] == ("communicate", 3.5)
+
+
+def test_whisper_cpp_windows_spawn_hardening_failures_do_not_block_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class _FakeProcess:
+        def __init__(self, cmd: list[str], **kwargs: object) -> None:
+            calls.append(("popen", list(cmd), kwargs))
+            self.returncode = 0
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            calls.append(("communicate", timeout))
+            return ("stdout", "")
+
+        def kill(self) -> None:
+            calls.append(("kill", None))
+
+    def _record_ctrl(*, ignore: bool) -> bool:
+        calls.append(("ctrl", ignore))
+        return False
+
+    monkeypatch.setattr(WhisperCppEngine, "_is_windows", staticmethod(lambda: True))
+    monkeypatch.setattr(
+        WhisperCppEngine,
+        "_set_windows_console_ctrl_handling",
+        staticmethod(_record_ctrl),
+    )
+    monkeypatch.setattr(subprocess, "Popen", _FakeProcess)
+
+    result = WhisperCppEngine._run_subprocess(["whisper-cli", "-h"], timeout=1.0)
+
+    assert result.stdout == "stdout"
+    assert calls[0] == ("ctrl", True)
+    assert calls[1][0] == "popen"
+    assert calls[2] == ("communicate", 1.0)
+
+
 def test_whisper_cpp_compute_resolution_logs_only_at_debug(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
